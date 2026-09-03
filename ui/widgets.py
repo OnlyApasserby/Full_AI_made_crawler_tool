@@ -1,383 +1,31 @@
-# -*- coding: utf-8 -*-
-"""多目标并发爬取 —— UI：任务管理标签页 + 任务配置对话框 + 任务对比对话框。
+"""自定义控件：「任务管理」标签页 TaskManagerTab。
 
-依赖 multi_task_core.TaskScheduler 与 bug.CrawlerMainWindow。
+多目标并发爬取的界面入口：并发控制 + 全局默认配置 + 任务列表表格 +
+批量/单选操作 + 详情与实时日志 + 汇总统计与导出。
 """
+
+from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-    QPushButton, QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QDoubleSpinBox, QFileDialog, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
+    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from multi_task_core import (
-    PRIORITY_TEXT, STATUS_COLORS, STATUS_TEXT, TaskConfig, TaskPriority,
-    TaskScheduler, TaskStatus, export_tasks_to_file, fmt_duration, now_str,
-)
+from models import STATUS_COLORS, TaskConfig, TaskStatus
+from utils.helpers import fmt_duration
+from manager.task_manager import TaskScheduler, export_tasks_to_file
+from .dialogs import TaskAddDialog, TaskCompareDialog
 
 
 def _exists_color(hex_color: str) -> QColor:
+    """把十六进制颜色字符串转为 QColor，非法值回退灰色。"""
     c = QColor(hex_color)
     return c if c.isValid() else QColor("#808080")
-
-
-class TaskAddDialog(QDialog):
-    """添加任务对话框：支持一次添加多个起始URL（每行一个）。
-
-    - 「使用全局默认配置」：复制标签页顶部的全局默认配置 + 主窗口屏蔽规则快照；
-    - 「使用自定义配置」：本对话框内的配置应用到本批全部新任务；
-    - 支持优先级与依赖任务ID（可多选/逗号分隔）。
-    """
-
-    def __init__(self, parent, defaults: TaskConfig, existing: list[dict],
-                 global_patterns: list[str], global_domains: list[str],
-                 title: str = "添加爬取任务", edit_cfg: TaskConfig | None = None):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.setMinimumWidth(640)
-        self.defaults = defaults
-        self.existing = existing
-        self.global_patterns = list(global_patterns)
-        self.global_domains = list(global_domains)
-        self.edit_cfg = edit_cfg
-        self._build_ui()
-        if edit_cfg is not None:
-            self._load_edit(edit_cfg)
-        else:
-            self._load_defaults()
-
-    # ---------------- UI ----------------
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        if self.edit_cfg is None:
-            root.addWidget(QLabel("起始网址（每行一个，每个URL将创建为独立任务）："))
-            self.urls_edit = QPlainTextEdit()
-            self.urls_edit.setPlaceholderText("https://www.example.com\nhttps://www.example.org")
-            self.urls_edit.setMaximumHeight(90)
-            root.addWidget(self.urls_edit)
-        else:
-            self.urls_edit = None
-
-        grp = QGroupBox("任务配置")
-        lay = QVBoxLayout(grp)
-        mode_row = QHBoxLayout()
-        self.global_radio = QCheckBox("使用全局默认配置（与主窗口爬取配置页一致）")
-        self.global_radio.setChecked(self.edit_cfg is None)
-        mode_row.addWidget(self.global_radio)
-        lay.addLayout(mode_row)
-
-        form = QVBoxLayout()
-        form.setSpacing(4)
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("深度："))
-        self.depth_spin = QSpinBox()
-        self.depth_spin.setRange(0, 5)
-        row1.addWidget(self.depth_spin)
-        row1.addSpacing(10)
-        row1.addWidget(QLabel("请求间隔："))
-        self.delay_spin = QDoubleSpinBox()
-        self.delay_spin.setRange(0.0, 10.0)
-        self.delay_spin.setSingleStep(0.1)
-        self.delay_spin.setSuffix(" 秒")
-        row1.addWidget(self.delay_spin)
-        row1.addSpacing(10)
-        row1.addWidget(QLabel("每页字符："))
-        self.chars_spin = QSpinBox()
-        self.chars_spin.setRange(0, 10_000_000)
-        self.chars_spin.setSingleStep(10000)
-        self.chars_spin.setSuffix(" (0不限)")
-        row1.addWidget(self.chars_spin)
-        row1.addStretch()
-        form.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        self.external_check = QCheckBox("允许站外链接")
-        row2.addWidget(self.external_check)
-        self.robots_check = QCheckBox("校验robots.txt（任务级）")
-        self.robots_check.setChecked(True)
-        row2.addWidget(self.robots_check)
-        row2.addSpacing(10)
-        row2.addWidget(QLabel("最大页数："))
-        self.max_pages_spin = QSpinBox()
-        self.max_pages_spin.setRange(0, 1_000_000)
-        self.max_pages_spin.setSuffix(" (0不限)")
-        row2.addWidget(self.max_pages_spin)
-        row2.addSpacing(10)
-        row2.addWidget(QLabel("自动重试："))
-        self.retries_spin = QSpinBox()
-        self.retries_spin.setRange(0, 10)
-        row2.addWidget(self.retries_spin)
-        row2.addStretch()
-        form.addLayout(row2)
-
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("定向关键词："))
-        self.link_filter_edit = QLineEdit()
-        self.link_filter_edit.setPlaceholderText("仅沿包含该关键词的链接继续递归，留空不限")
-        row3.addWidget(self.link_filter_edit, 1)
-        row3.addSpacing(10)
-        row3.addWidget(QLabel("优先级："))
-        self.priority_combo = QComboBox()
-        for val, text in PRIORITY_TEXT.items():
-            self.priority_combo.addItem(text, val)
-        row3.addWidget(self.priority_combo)
-        form.addLayout(row3)
-
-        row4 = QHBoxLayout()
-        row4.addWidget(QLabel("依赖任务ID："))
-        self.depends_edit = QLineEdit()
-        self.depends_edit.setPlaceholderText("任务B依赖任务A完成，填A的任务ID；多个用逗号分隔")
-        row4.addWidget(self.depends_edit, 1)
-        form.addLayout(row4)
-
-        row5 = QHBoxLayout()
-        row5.addWidget(QLabel("屏蔽URL正则："))
-        self.block_edit = QLineEdit()
-        self.block_edit.setPlaceholderText("任务级屏蔽（分号;分隔），仅作用于本任务")
-        row5.addWidget(self.block_edit, 1)
-        form.addLayout(row5)
-
-        row6 = QHBoxLayout()
-        row6.addWidget(QLabel("域名白名单："))
-        self.domains_edit = QLineEdit()
-        self.domains_edit.setPlaceholderText("任务级白名单（逗号,分隔），配置后仅爬取这些域名")
-        row6.addWidget(self.domains_edit, 1)
-        form.addLayout(row6)
-        lay.addLayout(form)
-        root.addWidget(grp)
-
-        self.existing_label = QLabel()
-        self.existing_label.setWordWrap(True)
-        self.existing_label.setStyleSheet("color: #666;")
-        root.addWidget(self.existing_label)
-
-        btns = QHBoxLayout()
-        self.ok_btn = QPushButton("确定")
-        self.ok_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("取消")
-        cancel_btn.clicked.connect(self.reject)
-        btns.addStretch()
-        btns.addWidget(self.ok_btn)
-        btns.addWidget(cancel_btn)
-        root.addLayout(btns)
-        self._refresh_existing()
-
-    def _refresh_existing(self):
-        if self.existing:
-            summary = "现有任务：\n" + "\n".join(
-                f"  ID {m['id']}: {m['name']} [{m['status_text']}]" for m in self.existing[:12])
-            self.existing_label.setText(summary)
-        else:
-            self.existing_label.setText("")
-
-    def _load_defaults(self):
-        d = self.defaults
-        self.depth_spin.setValue(d.max_depth)
-        self.delay_spin.setValue(d.request_delay)
-        self.chars_spin.setValue(d.max_chars_per_page)
-        self.external_check.setChecked(d.crawl_external)
-        self.robots_check.setChecked(d.robots_check)
-        self.max_pages_spin.setValue(d.max_pages)
-        self.retries_spin.setValue(d.max_retries)
-        self.link_filter_edit.setText(d.link_filter)
-        self.priority_combo.setCurrentIndex(max(0, d.priority))
-        self.block_edit.setText(";".join(d.block_patterns))
-        self.domains_edit.setText(",".join(d.allow_domains))
-        self._toggle_custom(self.global_radio.isChecked())
-        self.global_radio.toggled.connect(self._toggle_custom)
-
-    def _toggle_custom(self, use_global: bool):
-        # 优先级与依赖任务与配置来源无关，始终可设置
-        for w in (self.depth_spin, self.delay_spin, self.chars_spin, self.external_check,
-                  self.robots_check, self.max_pages_spin, self.retries_spin,
-                  self.link_filter_edit, self.block_edit, self.domains_edit):
-            w.setEnabled(not use_global)
-
-    def _load_edit(self, cfg: TaskConfig):
-        self.global_radio.setChecked(False)
-        self.global_radio.setEnabled(False)
-        self.depth_spin.setValue(cfg.max_depth)
-        self.delay_spin.setValue(cfg.request_delay)
-        self.chars_spin.setValue(cfg.max_chars_per_page)
-        self.external_check.setChecked(cfg.crawl_external)
-        self.robots_check.setChecked(cfg.robots_check)
-        self.max_pages_spin.setValue(cfg.max_pages)
-        self.retries_spin.setValue(cfg.max_retries)
-        self.link_filter_edit.setText(cfg.link_filter)
-        self.priority_combo.setCurrentIndex(max(0, min(2, cfg.priority)))
-        self.block_edit.setText(";".join(cfg.block_patterns))
-        self.domains_edit.setText(",".join(cfg.allow_domains))
-        self.depends_edit.setText(",".join(str(x) for x in cfg.depends_on))
-        self.depends_edit.setEnabled(True)
-
-    # ---------------- 取值 ----------------
-    def _collect(self, url: str) -> TaskConfig:
-        priority = self.priority_combo.currentData() or TaskPriority.MEDIUM
-        depends = self._parse_depends()
-        use_global = self.global_radio.isChecked()
-        if use_global:
-            cfg = TaskConfig(start_url=url.strip())
-            d = self.defaults
-            cfg.max_depth = d.max_depth
-            cfg.crawl_external = d.crawl_external
-            cfg.request_delay = d.request_delay
-            cfg.max_chars_per_page = d.max_chars_per_page
-            cfg.link_filter = d.link_filter
-            cfg.jitter = d.jitter
-            cfg.max_pages = d.max_pages
-            cfg.max_retries = d.max_retries
-            cfg.robots_check = d.robots_check
-            cfg.priority = priority
-            cfg.depends_on = depends
-            cfg.block_patterns = list(self.global_patterns)  # 主窗口屏蔽规则快照（任务级）
-            cfg.allow_domains = list(self.global_domains)
-            return cfg
-        return TaskConfig(
-            start_url=url.strip(),
-            max_depth=self.depth_spin.value(),
-            request_delay=self.delay_spin.value(),
-            max_chars_per_page=self.chars_spin.value(),
-            crawl_external=self.external_check.isChecked(),
-            robots_check=self.robots_check.isChecked(),
-            max_pages=self.max_pages_spin.value(),
-            max_retries=self.retries_spin.value(),
-            link_filter=self.link_filter_edit.text().strip(),
-            priority=priority,
-            depends_on=depends,
-            block_patterns=[p for p in (p.strip() for p in self.block_edit.text().split(";")) if p],
-            allow_domains=[d for d in (x.strip() for x in self.domains_edit.text().split(",")) if d],
-        )
-
-    def _parse_depends(self) -> list[int]:
-        ids = []
-        for tok in self.depends_edit.text().replace("；", ";").replace("，", ",").split(","):
-            tok = tok.strip()
-            if not tok:
-                continue
-            try:
-                i = int(tok)
-            except ValueError:
-                continue
-            if i in ids:
-                continue
-            if not any(m["id"] == i for m in self.existing):
-                QMessageBox.warning(self, "依赖任务不存在", f"依赖任务ID {i} 不存在，已忽略")
-                continue
-            ids.append(i)
-        return ids
-
-    def result_configs(self) -> list[TaskConfig]:
-        """返回本批新增任务的配置列表（编辑模式返回单个）"""
-        if self.edit_cfg is not None:
-            return [self._collect(self.edit_cfg.start_url)]
-        configs = []
-        for raw in self.urls_edit.toPlainText().splitlines():
-            url = raw.strip()
-            if not url:
-                continue
-            if not url.startswith(("http://", "https://")):
-                QMessageBox.warning(self, "无效网址", f"已跳过无效网址：{url}")
-                continue
-            configs.append(self._collect(url))
-        return configs
-
-
-class TaskCompareDialog(QDialog):
-    """任务对比汇总对话框：各任务完成情况对比 + 合并导出"""
-
-    def __init__(self, parent, scheduler: TaskScheduler):
-        super().__init__(parent)
-        self.scheduler = scheduler
-        self.setWindowTitle("任务对比汇总")
-        self.resize(880, 460)
-        self._build_ui()
-        self._reload()
-
-    def _build_ui(self):
-        root = QVBoxLayout(self)
-        self.table = QTableWidget(0, 10)
-        self.table.setHorizontalHeaderLabels(
-            ["ID", "任务名/起始URL", "状态", "页面数", "链接数", "媒体数",
-             "当前深度/最大", "重试", "耗时", "失败原因"])
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
-        root.addWidget(self.table)
-
-        btns = QHBoxLayout()
-        self.export_btn = QPushButton("合并导出全部任务...")
-        self.export_btn.clicked.connect(self._on_export)
-        btns.addWidget(self.export_btn)
-        btns.addStretch()
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(self.accept)
-        btns.addWidget(close_btn)
-        root.addLayout(btns)
-
-    def _reload(self):
-        metas = self.scheduler.task_metas()
-        self.table.setRowCount(len(metas))
-        totals = self.scheduler.summary()
-        for r, m in enumerate(metas):
-            values = [
-                str(m["id"]),
-                f"{m['name']}\n{m['start_url']}",
-                m["status_text"],
-                str(m["pages"]),
-                str(m["link_count"]),
-                str(m["media_count"]),
-                f"{m['current_depth']}/{m['max_depth']}",
-                f"{m['retry_count']}/{m['max_retries']}",
-                fmt_duration(m["duration"]),
-                m["error"] or "",
-            ]
-            for c, v in enumerate(values):
-                item = QTableWidgetItem(v)
-                if c == 2:
-                    item.setForeground(_exists_color(STATUS_COLORS.get(m["status"], "#808080")))
-                if c == 0:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(r, c, item)
-        # 汇总行
-        r = self.table.rowCount()
-        self.table.insertRow(r)
-        total_text = (f"合计 {totals['total']} 个任务：已完成 {totals[TaskStatus.COMPLETED]}，"
-                      f"执行中 {totals[TaskStatus.RUNNING]}，暂停 {totals[TaskStatus.PAUSED]}，"
-                      f"失败 {totals[TaskStatus.FAILED]}")
-        item = QTableWidgetItem(total_text)
-        item.setForeground(QColor("#1565c0"))
-        self.table.setItem(r, 1, item)
-        self.table.setItem(r, 3, QTableWidgetItem(str(totals["pages"])))
-        self.table.setItem(r, 4, QTableWidgetItem(str(totals["links"])))
-        self.table.setItem(r, 5, QTableWidgetItem(str(totals["media"])))
-        self.table.setItem(r, 8, QTableWidgetItem(fmt_duration(totals["elapsed"])))
-
-    def _on_export(self):
-        rows = self.scheduler.merged_results()
-        if not rows:
-            QMessageBox.information(self, "导出", "没有可导出的任务结果（先运行任务）")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "合并导出全部任务结果",
-            os.path.join(os.getcwd(), f"tasks_export_{datetime_stamp()}.csv"),
-            "CSV 文件 (*.csv);;JSON 文件 (*.json);;Markdown 文件 (*.md)")
-        if not path:
-            return
-        try:
-            n = export_tasks_to_file(rows, path)
-            QMessageBox.information(self, "导出成功", f"已导出 {n} 条记录到：\n{path}")
-        except Exception as e:
-            QMessageBox.critical(self, "导出失败", str(e))
-
-
-def datetime_stamp() -> str:
-    return now_str().replace(":", "-").replace(" ", "_")
 
 
 class TaskManagerTab(QWidget):
@@ -779,7 +427,7 @@ class TaskManagerTab(QWidget):
             ids = self.scheduler.add_tasks(configs)
             added = len(ids)
             QMessageBox.information(self, "添加任务", f"已添加 {added} 个任务到队列\n"
-                                                     f"（按最大并发数 {self.scheduler.get_max_concurrent()} 自动调度执行）")
+                                                      f"（按最大并发数 {self.scheduler.get_max_concurrent()} 自动调度执行）")
 
     def _on_edit_selected(self):
         tid = self._single_id()
@@ -937,3 +585,6 @@ class TaskManagerTab(QWidget):
                         item = QTableWidgetItem()
                         self.table.setItem(row, self.col("elapsed"), item)
                     item.setText(fmt_duration(meta["duration"]))
+
+
+__all__ = ["TaskManagerTab"]

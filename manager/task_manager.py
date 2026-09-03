@@ -1,178 +1,45 @@
-# -*- coding: utf-8 -*-
-"""多目标网站并发爬取 —— 核心：任务模型 / 优先级队列 / 调度器 / 结果导出。
-UI（任务管理标签页）见 multi_task_ui.py。
+"""多任务管理（多目标网站并发爬取）—— 核心：任务调度器 + 合并导出。
+
+- 任务模型 / 优先级 / 依赖 / 队列持久化集中在 models 与本模块；
+- 并发控制：每个运行任务 = 独立 RecursiveCrawlerThread，运行时只保留
+  ``max_concurrent`` 个存活爬虫线程，其余按（优先级, ID）排队，容量释放后
+  自动补位 —— 等价于可动态调整的线程池；另用 manager.thread_manager 的
+  QThreadPool 承载队列/结果文件等异步落盘。
+- 所有爬虫线程信号经队列连接回 GUI 线程处理，状态变化通过信号通知 UI。
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
-import re
 import shutil
-import sqlite3
 import threading
-from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
-from urllib.parse import urlparse
 
-from PyQt6.QtCore import QObject, QRunnable, QThread, QThreadPool, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
-try:  # 运行 bug.py 时本行在运行时执行（避免顶层循环导入）
-    from bug import RecursiveCrawlerThread, RobotsCheckThread, RobotsParser, URLFilter, UserAgentPool
-except Exception:
-    RecursiveCrawlerThread = RobotsCheckThread = None
-    RobotsParser = URLFilter = UserAgentPool = None
+from models import (
+    PRIORITY_TEXT, STATUS_TEXT, TaskConfig, TaskPriority, TaskStatus,
+)
+from utils.helpers import now_str, sanitize_name, url_domain
+from utils.validators import valid_http_url
+from utils.user_agents import UserAgentPool
+from core.crawler import RecursiveCrawlerThread
+from core.robots import RobotsCheckThread, RobotsParser
+from core.filter import URLFilter
+from manager.db_manager import configure_wal
+from manager.thread_manager import ThreadPoolManager
 
-
-# ---------------------------------------------------------------------------
-# 常量
-# ---------------------------------------------------------------------------
-class TaskStatus:
-    PENDING = "pending"      # 待执行
-    RUNNING = "running"      # 执行中
-    COMPLETED = "completed"  # 已完成
-    PAUSED = "paused"        # 暂停
-    FAILED = "failed"        # 失败
-
-
-STATUS_TEXT = {
-    TaskStatus.PENDING: "待执行", TaskStatus.RUNNING: "执行中",
-    TaskStatus.COMPLETED: "已完成", TaskStatus.PAUSED: "暂停",
-    TaskStatus.FAILED: "失败",
-}
-
-STATUS_COLORS = {
-    TaskStatus.PENDING: "#808080", TaskStatus.RUNNING: "#1e7e34",
-    TaskStatus.COMPLETED: "#1565c0", TaskStatus.PAUSED: "#e65100",
-    TaskStatus.FAILED: "#c62828",
-}
-
-
-class TaskPriority:
-    HIGH, MEDIUM, LOW = 0, 1, 2
-
-
-PRIORITY_TEXT = {TaskPriority.HIGH: "高", TaskPriority.MEDIUM: "中", TaskPriority.LOW: "低"}
+# 终态 / 需要持久化的状态集合（模块私有）
 _TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED}
 _PERSIST_STATES = {TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.PAUSED}
 
 
-# ---------------------------------------------------------------------------
-# 工具
-# ---------------------------------------------------------------------------
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def fmt_duration(seconds) -> str:
-    seconds = max(0, int(seconds or 0))
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def url_domain(url: str) -> str:
-    try:
-        return urlparse(url).netloc
-    except Exception:
-        return ""
-
-
-def sanitize_name(name: str) -> str:
-    return re.sub(r"[^\w\-.]+", "_", str(name)).strip("_")[:80] or "task"
-
-
-def valid_http_url(url: str) -> bool:
-    try:
-        return url.startswith(("http://", "https://")) and bool(urlparse(url).netloc)
-    except Exception:
-        return False
-
-
-# ---------------------------------------------------------------------------
-# 任务配置
-# ---------------------------------------------------------------------------
-@dataclass
-class TaskConfig:
-    """单任务配置（与 RecursiveCrawlerThread 构造参数对应 + 任务级控制项）。"""
-    task_name: str = ""
-    start_url: str = ""
-    max_depth: int = 1
-    crawl_external: bool = False
-    request_delay: float = 0.5
-    max_chars_per_page: int = 0     # 0=不限制
-    link_filter: str = ""           # 定向爬取关键词
-    jitter: float = 0.3
-    max_pages: int = 0              # 0=不限制
-    max_retries: int = 2
-    robots_check: bool = True
-    priority: int = TaskPriority.MEDIUM
-    depends_on: list = field(default_factory=list)   # 依赖任务ID（需其完成才启动）
-    proxy: dict = field(default_factory=dict)
-    block_patterns: list = field(default_factory=list)  # 任务级屏蔽正则
-    allow_domains: list = field(default_factory=list)   # 任务级域名白名单
-
-    def to_dict(self) -> dict:
-        return {
-            "task_name": self.task_name, "start_url": self.start_url,
-            "max_depth": self.max_depth, "crawl_external": self.crawl_external,
-            "request_delay": self.request_delay, "max_chars_per_page": self.max_chars_per_page,
-            "link_filter": self.link_filter, "jitter": self.jitter,
-            "max_pages": self.max_pages, "max_retries": self.max_retries,
-            "robots_check": self.robots_check, "priority": self.priority,
-            "depends_on": list(self.depends_on), "proxy": dict(self.proxy),
-            "block_patterns": list(self.block_patterns), "allow_domains": list(self.allow_domains),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "TaskConfig":
-        return cls(
-            task_name=str(data.get("task_name", "")),
-            start_url=str(data.get("start_url", "")),
-            max_depth=int(data.get("max_depth", 1)),
-            crawl_external=bool(data.get("crawl_external", False)),
-            request_delay=float(data.get("request_delay", 0.5)),
-            max_chars_per_page=int(data.get("max_chars_per_page", 0)),
-            link_filter=str(data.get("link_filter", "")),
-            jitter=float(data.get("jitter", 0.3)),
-            max_pages=int(data.get("max_pages", 0)),
-            max_retries=int(data.get("max_retries", 2)),
-            robots_check=bool(data.get("robots_check", True)),
-            priority=int(data.get("priority", TaskPriority.MEDIUM)),
-            depends_on=[int(x) for x in (data.get("depends_on") or [])],
-            proxy=dict(data.get("proxy") or {}),
-            block_patterns=[str(x) for x in (data.get("block_patterns") or [])],
-            allow_domains=[str(x) for x in (data.get("allow_domains") or [])],
-        )
-
-
-# ---------------------------------------------------------------------------
-# 异步IO执行体（QThreadPool 落盘，避免阻塞GUI）
-# ---------------------------------------------------------------------------
-class _IORunnable(QRunnable):
-    def __init__(self, fn):
-        super().__init__()
-        self._fn = fn
-
-    def run(self):
-        try:
-            self._fn()
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# 任务调度器
-# ---------------------------------------------------------------------------
 class TaskScheduler(QObject):
-    """任务队列 + 优先级 + 依赖 + 动态并发线程池（QThread 列表式调度）调度器。
+    """任务队列 + 优先级 + 依赖 + 动态并发线程池调度器。"""
 
-    - 并发控制：每个运行任务 = 独立 RecursiveCrawlerThread；运行时只保留
-      max_concurrent 个存活爬虫线程，其余待执行任务按（优先级，ID）排队，
-      容量释放后自动补位 —— 等价于可动态调整的线程池；
-      另用 QThreadPool 承载队列/结果文件等异步落盘。
-    - 所有爬虫线程信号经队列连接回GUI线程处理，状态变化通过信号通知UI。
-    """
     task_added = pyqtSignal(int)
     task_changed = pyqtSignal(int)
     task_log_line = pyqtSignal(int, str)
@@ -183,8 +50,6 @@ class TaskScheduler(QObject):
                  base_download_dir: str | None = None, ua_pool=None,
                  queue_file: str | None = None):
         super().__init__()
-        if RecursiveCrawlerThread is None or RobotsCheckThread is None:
-            raise ImportError("multi_task 依赖 bug.py（RecursiveCrawlerThread 等），请从 bug.py 启动")
         self._lock = threading.RLock()
         self.data_root = data_root or os.path.join(os.getcwd(), "task_data")
         os.makedirs(self.data_root, exist_ok=True)
@@ -193,8 +58,7 @@ class TaskScheduler(QObject):
 
         self.max_concurrent = max(1, int(max_concurrent))
         self.ua_pool = ua_pool or UserAgentPool()
-        self._io_pool = QThreadPool()
-        self._io_pool.setMaxThreadCount(4)
+        self._io_pool = ThreadPoolManager(max_threads=4)
 
         self.tasks: dict[int, dict] = {}
         self._pending_ids: list[int] = []
@@ -317,13 +181,7 @@ class TaskScheduler(QObject):
                 "results_path": os.path.join(task_dir, "results.json"), "log_lines": [],
             }
             # 任务级独立数据库：WAL 模式（多线程并发读写 + 与主库隔离）
-            try:
-                conn = sqlite3.connect(rec["db_path"])
-                conn.execute("PRAGMA journal_mode=WAL;")
-                conn.execute("PRAGMA busy_timeout=5000;")
-                conn.close()
-            except Exception:
-                pass
+            configure_wal(rec["db_path"])
             self.tasks[tid] = rec
             self._enqueue_pending(tid)
             self.task_added.emit(tid)
@@ -839,7 +697,7 @@ class TaskScheduler(QObject):
             "media_urls": list(rec.get("media_urls", [])),
         }
         path = rec["results_path"]
-        self._io_pool.start(_IORunnable(partial(self._dump_json, path, snapshot)))
+        self._io_pool.submit(partial(self._dump_json, path, snapshot))
 
     @staticmethod
     def _dump_json(path: str, data: dict):
@@ -875,7 +733,7 @@ class TaskScheduler(QObject):
                 })
             payload = {"version": 1, "saved_at": now_str(), "tasks": data}
         try:
-            self._io_pool.start(_IORunnable(partial(self._dump_json, self.queue_file, payload)))
+            self._io_pool.submit(partial(self._dump_json, self.queue_file, payload))
         except Exception:
             pass
 
@@ -972,7 +830,7 @@ class TaskScheduler(QObject):
                 self.save_queue()
             except Exception:
                 pass
-        self._io_pool.waitForDone(2000)
+        self._io_pool.wait_for_done(2000)
 
     @staticmethod
     def _elapsed_since(rec: dict) -> float:
@@ -1014,3 +872,6 @@ def export_tasks_to_file(rows: list[dict], filepath: str) -> int:
             writer.writerow([row.get("task_id"), row.get("task_name"),
                              row.get("url"), row.get("text") or ""])
     return len(rows)
+
+
+__all__ = ["TaskScheduler", "export_tasks_to_file"]
