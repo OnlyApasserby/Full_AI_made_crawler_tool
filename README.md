@@ -1,0 +1,2 @@
+# Full_AI_made_crawler_tool
+正如仓库名所描述的，完全由AI编写，在此感谢CodeBuddy和DeepSeekAPI的支持。
