@@ -337,7 +337,7 @@ class TaskAddDialog(QDialog):
         grp = QGroupBox("任务配置")
         lay = QVBoxLayout(grp)
         mode_row = QHBoxLayout()
-        self.global_radio = QCheckBox("使用全局默认配置（与主窗口爬取配置页一致）")
+        self.global_radio = QCheckBox("使用全局默认配置（沿用「爬取配置」/「工具配置」页的设置）")
         self.global_radio.setChecked(self.edit_cfg is None)
         mode_row.addWidget(self.global_radio)
         lay.addLayout(mode_row)
@@ -353,7 +353,7 @@ class TaskAddDialog(QDialog):
         self.task_type_combo.addItem("媒体抓取（图像 / 视频）", TASK_TYPE_MEDIA)
         self.task_type_combo.setToolTip(
             "媒体抓取：静态+浏览器渲染双模式，支持懒加载/图集翻页/XHR 监听，\n"
-            "并做去重与质量过滤；详细选项可在「爬取配置」页先调好再用全局默认配置")
+            "并做去重与质量过滤；详细选项可在「工具配置」页先调好再用全局默认配置")
         self.task_type_combo.currentIndexChanged.connect(self._toggle_media_options)
         row0.addWidget(self.task_type_combo)
         row0.addSpacing(10)
@@ -521,7 +521,7 @@ class TaskAddDialog(QDialog):
     def _media_payload(self) -> dict:
         """构造任务级媒体配置；非媒体任务返回空字典。
 
-        全局配置模式下沿用主窗口「爬取配置」页的详细媒体设置，
+        全局配置模式下沿用主窗口「工具配置」页的详细媒体设置，
         自定义模式则用本对话框的少量选项覆盖关键字段（类型/模式/页数上限）。
         """
         if self.task_type_combo.currentData() != TASK_TYPE_MEDIA:

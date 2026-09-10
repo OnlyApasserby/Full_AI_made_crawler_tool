@@ -1,12 +1,19 @@
-"""主窗口：单任务递归爬取 / 媒体抓取 + 反爬设置 + 下载管理（+ 任务管理标签页）。
+"""主窗口：爬取配置（含多任务队列）+ 工具配置 + 下载管理。
 
 业务逻辑（爬取/下载/数据库）均已下沉到 core / manager / utils，
 本模块只负责界面与用户交互、线程的信号连接与结果展示。
 
-「爬取配置」页提供两种流程：
-- **递归爬取**（原有）：以页面文字与链接为目标，BFS 深度遍历
-- **媒体抓取**（新增）：以图像/视频为目标，静态与浏览器渲染双模式，
-  支持懒加载滚动、图集翻页、XHR 网络监听、去重与质量过滤
+三个标签页（原先独立的「任务管理」页已按去重方案并入，避免同一参数多处配置）：
+- **爬取配置**：起始 URL、爬取参数、robots 预览、日志与链接、多任务队列（可折叠，默认收起）
+- **工具配置**：UA 池、请求策略、代理、媒体抓取设置（图像/视频抓取的全部选项）
+- **下载管理**：下载目录/并发/限速、媒体资源列表、失败列表与下载日志
+
+「爬取配置」页的启动按钮按媒体抓取开关分流：
+- **递归爬取**：以页面文字与链接为目标，BFS 深度遍历
+- **媒体抓取**：以图像/视频为目标，静态与浏览器渲染双模式，支持懒加载滚动、
+  图集翻页、XHR 网络监听、去重与质量过滤
+参数的唯一来源约定：爬取参数只在「爬取配置」页维护，媒体参数只在「工具配置」页维护，
+下载参数只在「下载管理」页维护——多任务队列面板一律读取这些控件。
 """
 
 from __future__ import annotations
@@ -19,8 +26,8 @@ import time
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox,
-    QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget,
-    QTextEdit, QToolBar, QVBoxLayout, QWidget,
+    QPushButton, QSpinBox, QTabWidget, QTextEdit, QToolBar, QVBoxLayout,
+    QWidget,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QShortcut, QKeySequence
@@ -54,18 +61,7 @@ from ui.export import (
 from ui.dialogs import ExportDialog, URLFilterDialog
 from ui.rule_dialog import SiteRuleDialog
 from ui.security_dialog import LinkGuardDialog
-
-#: 媒体结果表格最多展示的行数（超出的仍会参与下载，仅界面截断以保证流畅）
-MEDIA_TABLE_LIMIT = 500
-#: 媒体结果表格列定义：(标题, 取值函数)
-MEDIA_TABLE_COLUMNS = (
-    ("类型", lambda item: item.kind),
-    ("合集", lambda item: item.album),
-    ("序号", lambda item: str(item.index or "")),
-    ("分辨率", lambda item: item.resolution),
-    ("来源", lambda item: item.origin),
-    ("资源URL", lambda item: item.url),
-)
+from ui.widgets import CollapsibleGroupBox, TaskQueuePanel
 
 
 class CrawlerMainWindow(QMainWindow):
@@ -134,20 +130,20 @@ class CrawlerMainWindow(QMainWindow):
         self.rule_manage_btn.clicked.connect(self.on_open_rule_dialog)
         toolbar.addWidget(self.rule_manage_btn)
 
-        # 1. 标签页：爬取配置 / 反爬设置 / 下载管理
+        # 1. 标签页：爬取配置（含多任务队列）/ 工具配置 / 下载管理
         self.tabs = QTabWidget()
         self.crawl_tab = QWidget()
-        self.anti_tab = QWidget()
+        self.tool_tab = QWidget()
         self.download_tab = QWidget()
         self.tabs.addTab(self.crawl_tab, "爬取配置")
-        self.tabs.addTab(self.anti_tab, "反爬设置")
+        self.tabs.addTab(self.tool_tab, "工具配置")
         self.tabs.addTab(self.download_tab, "下载管理")
         main_layout.addWidget(self.tabs, 1)
 
-        self._init_crawl_tab()
-        self._init_anti_tab()
+        self._init_crawl_tab()          # 含：多任务队列（可折叠分组）
+        self._init_tool_tab()           # UA/代理 + 媒体抓取设置
         self._init_download_tab()
-        self._init_task_manager_tab()  # 任务管理（多目标并发爬取）
+        self._sync_task_download_dir()  # 任务下载根目录对齐「下载管理」页
 
         self.pending_crawl_url = ""
         self.robots_content = ""
@@ -222,19 +218,8 @@ class CrawlerMainWindow(QMainWindow):
         filter_layout.addStretch()
         layout.addLayout(filter_layout)
 
-        # 媒体抓取（图像/视频）配置：以媒体资源为目标的增强抓取流程
-        layout.addWidget(self._build_media_group())
-        # 媒体抓取结果表格（类型/合集/分辨率/来源），爬取过程中实时刷新
-        self.media_result_table = QTableWidget(0, len(MEDIA_TABLE_COLUMNS))
-        self.media_result_table.setHorizontalHeaderLabels(
-            [title for title, _getter in MEDIA_TABLE_COLUMNS])
-        self.media_result_table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers)
-        self.media_result_table.setMaximumHeight(150)
-        self.media_result_table.verticalHeader().setVisible(False)
-        self.media_result_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.media_result_table)
-        self._refresh_browser_status()  # 浏览器内核状态（仅查找，不启动）
+        # 媒体抓取设置已移至「工具配置」页；媒体元信息不再在界面展示，
+        # 需要时可通过「导出媒体清单」导出为 CSV / JSON / Markdown。
 
         # robots.txt展示区
         layout.addWidget(QLabel("robots.txt 规则预览："))
@@ -293,6 +278,9 @@ class CrawlerMainWindow(QMainWindow):
         layout.addWidget(QLabel("页面提取到的所有链接汇总："))
         layout.addWidget(self.link_display, 1)
 
+        # 多任务队列（原「任务管理」页并入）：默认收起，不影响单任务流程
+        layout.addWidget(self._build_task_queue_section())
+
         # 站点适配器插件提示（core/extractor/sites 下放入 .py 即自动注册）
         plugins = plugin_classes()
         if plugins:
@@ -300,11 +288,32 @@ class CrawlerMainWindow(QMainWindow):
                 f"已加载 {len(plugins)} 个站点适配器插件："
                 + "、".join(getattr(cls, "name", cls.__name__) for cls in plugins))
 
-    # ---------- 标签页1：媒体抓取配置区 ----------
-    def _build_media_group(self) -> QGroupBox:
-        """构建「媒体抓取（图像/视频）」配置分组。
+    def _build_task_queue_section(self) -> CollapsibleGroupBox:
+        """创建「多任务队列」可折叠分组（原「任务管理」页的独有功能）。
 
-        与原有递归爬取共用起始网址、请求间隔、反爬与过滤规则，
+        只承载多任务调度真正独有的控件（并发数 / 任务级重试 / 队列持久化 / 任务表格）；
+        爬取参数读取本页控件，下载目录读取「下载管理」页，从而消除原先三处重复配置。
+        """
+        group = CollapsibleGroupBox("多任务队列（多目标并发爬取，点击标题展开）",
+                                    collapsed=True)
+        self.task_panel = TaskQueuePanel(main_window=self)
+        # 收起时容器隐藏、不占空间；展开时给队列表格足够高度
+        self.task_panel.setMinimumHeight(340)
+        group.content_layout().addWidget(self.task_panel)
+        return group
+
+    def _sync_task_download_dir(self) -> None:
+        """把「下载管理」页的下载目录同步给多任务调度器（保持单一来源）。"""
+        panel = getattr(self, "task_panel", None)
+        if panel is None or not hasattr(self, "download_dir_input"):
+            return
+        panel.set_download_dir(self._resolve_download_dir())
+
+    # ---------- 标签页2「工具配置」：媒体抓取设置区 ----------
+    def _build_media_group(self) -> QGroupBox:
+        """构建「媒体抓取（图像 / 视频）」配置分组（归属「工具配置」页）。
+
+        与递归爬取共用起始网址、请求间隔、反爬与过滤规则，
         这里只补充媒体抓取专有的选项（目标类型 / 渲染模式 / 翻页 / 质量过滤）。
         """
         group = QGroupBox("媒体抓取（图像 / 视频）")
@@ -503,28 +512,9 @@ class CrawlerMainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "浏览器不可用", why)
 
-    # ---------- 媒体结果表格 ----------
-    def _clear_media_table(self) -> None:
-        """清空媒体结果表格。"""
-        self.media_result_table.setRowCount(0)
-
-    def _fill_media_table(self, items) -> None:
-        """按 MediaItem 元信息刷新结果表格（超量仅展示前 N 行）。"""
-        rows = list(items)[:MEDIA_TABLE_LIMIT]
-        table = self.media_result_table
-        table.setRowCount(len(rows))
-        for row, item in enumerate(rows):
-            for col, (_title, getter) in enumerate(MEDIA_TABLE_COLUMNS):
-                try:
-                    value = str(getter(item) or "")
-                except Exception:
-                    value = ""
-                table.setItem(row, col, QTableWidgetItem(value[:150]))
-        table.resizeColumnsToContents()
-
-    # ---------- 标签页2：反爬设置 ----------
-    def _init_anti_tab(self):
-        layout = QVBoxLayout(self.anti_tab)
+    # ---------- 标签页2：工具配置 ----------
+    def _init_tool_tab(self):
+        layout = QVBoxLayout(self.tool_tab)
         layout.setSpacing(12)
 
         # UA池管理
@@ -581,6 +571,10 @@ class CrawlerMainWindow(QMainWindow):
         proxy_layout.addLayout(proxy_row)
         layout.addWidget(proxy_group)
 
+        # 媒体抓取（图像/视频）设置：原位于「爬取配置」页，现归入工具配置
+        layout.addWidget(self._build_media_group())
+        self._refresh_browser_status()  # 浏览器内核状态（仅查找，不启动）
+
         layout.addStretch()
 
     # ---------- 标签页3：下载管理 ----------
@@ -594,7 +588,10 @@ class CrawlerMainWindow(QMainWindow):
         dir_row = QHBoxLayout()
         dir_row.addWidget(QLabel("下载目录："))
         self.download_dir_input = QLineEdit("downloads")
-        self.download_dir_input.setPlaceholderText("媒体文件保存目录，按 资源类型/域名 自动分子文件夹")
+        self.download_dir_input.setPlaceholderText(
+            "媒体文件保存目录，按 资源类型/域名 自动分子文件夹（多任务队列的下载根目录同此）")
+        # 单一来源：下载目录变化时同步给多任务队列，避免两处各自维护
+        self.download_dir_input.textChanged.connect(self._sync_task_download_dir)
         self.download_dir_btn = QPushButton("浏览...")
         self.download_dir_btn.clicked.connect(self.on_choose_download_dir)
         dir_row.addWidget(self.download_dir_input, 1)
@@ -770,8 +767,9 @@ class CrawlerMainWindow(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "选择下载目录",
                                                      self._resolve_download_dir())
         if directory:
-            self.download_dir_input.setText(directory)
+            self.download_dir_input.setText(directory)   # 触发下载目录同步
             self._update_disk_status()
+            self._sync_task_download_dir()
 
     def _launch_downloader(self, urls):
         """创建并启动下载器实例（开始下载与重新下载失败资源共用）"""
@@ -1141,7 +1139,6 @@ class CrawlerMainWindow(QMainWindow):
         self.last_crawl_links = []
         self.last_page_texts = {}
         self.media_list.clear()
-        self._clear_media_table()
         self.download_btn.setEnabled(False)
         self.log_display.clear()
         self.log_display.append("=== 媒体抓取任务启动（图像/视频增强流程） ===")
@@ -1169,9 +1166,12 @@ class CrawlerMainWindow(QMainWindow):
         self.media_thread.start()
 
     def on_media_items(self, items):
-        """媒体抓取线程回传 MediaItem 列表（含合集/序号/分辨率元信息）。"""
+        """媒体抓取线程回传 MediaItem 列表。
+
+        界面不再展示媒体元信息（仅保留下载管理中的 URL 列表），
+        此处只缓存结果用于「导出媒体清单」与携带元信息下载。
+        """
         self.media_items = list(items or [])
-        self._fill_media_table(self.media_items)
         self.export_media_btn.setEnabled(bool(self.media_items))
 
     def on_media_progress(self, pages, media, pending):
@@ -1378,7 +1378,6 @@ class CrawlerMainWindow(QMainWindow):
         self.media_list.clear()
         self.media_items = []
         self.media_urls = []
-        self._clear_media_table()
         self.export_media_btn.setEnabled(False)
         self.download_log.clear()
         self.failed_list.clear()
@@ -1415,19 +1414,13 @@ class CrawlerMainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"清空爬取记录失败：{str(e)}")
 
-    # ---------- 任务管理标签页（多目标并发爬取） ----------
-    def _init_task_manager_tab(self):
-        """初始化「任务管理」标签页（延迟导入 ui.widgets，避免包初始化耦合）。"""
-        from ui.widgets import TaskManagerTab
-        self.task_tab = TaskManagerTab(main_window=self)
-        self.tabs.addTab(self.task_tab, "任务管理")
-
+    # ---------- 多任务队列（原「任务管理」标签页，现并入「爬取配置」页） ----------
     def _stop_task_manager(self):
-        """停止任务管理器中所有运行中的多任务爬虫并保存任务队列（窗口关闭时调用）"""
-        task_tab = getattr(self, "task_tab", None)
-        if task_tab is not None:
+        """停止多任务队列中所有运行中的任务并保存队列（窗口关闭时调用）。"""
+        panel = getattr(self, "task_panel", None)
+        if panel is not None:
             try:
-                task_tab.scheduler.shutdown(save_queue=True)
+                panel.scheduler.shutdown(save_queue=True)
             except Exception:
                 pass
 
@@ -1468,11 +1461,12 @@ class CrawlerMainWindow(QMainWindow):
         thread = getattr(self, "crawl_thread", None)
         media_thread = getattr(self, "media_thread", None)
         downloader = self.downloader
-        task_tab = getattr(self, "task_tab", None)
+        task_panel = getattr(self, "task_panel", None)
         running = (thread is not None and thread.isRunning()) or \
                   (media_thread is not None and media_thread.isRunning()) or \
                   (downloader is not None and downloader.isRunning()) or \
-                  (task_tab is not None and task_tab.scheduler.has_running_tasks())
+                  (task_panel is not None
+                   and task_panel.scheduler.has_running_tasks())
         if running:
             reply = QMessageBox.question(
                 self, "退出确认",

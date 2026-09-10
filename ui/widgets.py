@@ -1,7 +1,9 @@
-"""自定义控件：「任务管理」标签页 TaskManagerTab。
+"""自定义控件：多任务队列面板 TaskQueuePanel + 可折叠分组 CollapsibleGroupBox。
 
-多目标并发爬取的界面入口：并发控制 + 全局默认配置 + 任务列表表格 +
-批量/单选操作 + 详情与实时日志 + 汇总统计与导出。
+``TaskQueuePanel`` 只负责**多任务调度**本身（任务表格、批量/单选操作、优先级与
+依赖、队列持久化、对比与汇总导出）。爬取参数（深度/间隔/字符/站外/关键词）
+与下载目录不再在此配置，统一沿用主窗口「爬取配置」「下载管理」两页的控件，
+避免同一参数在多处重复且互相打架。
 """
 
 from __future__ import annotations
@@ -11,9 +13,9 @@ import os
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QDoubleSpinBox, QFileDialog, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton,
-    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QDialog, QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QSplitter,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from models import STATUS_COLORS, TaskConfig, TaskStatus
@@ -28,8 +30,49 @@ def _exists_color(hex_color: str) -> QColor:
     return c if c.isValid() else QColor("#808080")
 
 
-class TaskManagerTab(QWidget):
-    """「任务管理」标签页：并发控制 + 任务列表 + 批量操作 + 汇总统计/导出。"""
+class CollapsibleGroupBox(QGroupBox):
+    """可折叠分组框：勾选标题即展开，取消勾选即收起（默认收起）。
+
+    用于把「多任务队列」这类占空间、但并非每次都要用的面板收进爬取配置页底部。
+    展开/收起只影响可见性，不改变其中控件的内容与状态。
+    """
+
+    def __init__(self, title: str, collapsed: bool = True, parent=None):
+        super().__init__(title, parent)
+        self._container = QWidget(self)
+        self._content_layout = QVBoxLayout(self._container)
+        self._content_layout.setContentsMargins(6, 2, 6, 6)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 14, 6, 6)
+        outer.addWidget(self._container)
+        self.setCheckable(True)
+        self.setChecked(not collapsed)
+        self.setToolTip("勾选标题=展开面板，取消勾选=收起（不影响其中的任务与配置）")
+        self.toggled.connect(self._on_toggled)
+        self._on_toggled(not collapsed)
+
+    def content_layout(self) -> QVBoxLayout:
+        """返回内容区布局，供外部添加控件。"""
+        return self._content_layout
+
+    def set_expanded(self, expanded: bool) -> None:
+        """程序化展开/收起。"""
+        self.setChecked(bool(expanded))
+
+    def is_expanded(self) -> bool:
+        """当前是否处于展开状态。"""
+        return self.isChecked()
+
+    def _on_toggled(self, expanded: bool) -> None:
+        self._container.setVisible(bool(expanded))
+
+
+class TaskQueuePanel(QWidget):
+    """多任务队列面板：并发控制 + 任务列表 + 批量操作 + 汇总统计/导出。
+
+    参数来源：爬取参数沿用主窗口「爬取配置」页，下载目录沿用「下载管理」页，
+    因此本面板只保留多任务调度自身独有的设置（并发数 / 任务级重试 / 队列持久化）。
+    """
 
     def __init__(self, main_window=None, scheduler: TaskScheduler | None = None):
         super().__init__()
@@ -59,68 +102,32 @@ class TaskManagerTab(QWidget):
         root.setSpacing(6)
         root.setContentsMargins(6, 6, 6, 6)
 
-        # ---- 顶部：并发 + 全局默认配置 ----
-        cfg_box = QGroupBox("并发控制与全局默认配置（添加任务时可改为独立配置）")
-        cfg_lay = QVBoxLayout(cfg_box)
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("最大并发任务数："))
+        # ---- 顶部：并发控制（其余参数统一沿用「爬取配置」/「下载管理」页）----
+        cfg_box = QGroupBox("并发控制（爬取参数沿用「爬取配置」页，下载目录沿用「下载管理」页）")
+        cfg_lay = QHBoxLayout(cfg_box)
+        cfg_lay.addWidget(QLabel("最大并发任务数："))
         self.concurrent_spin = QSpinBox()
         self.concurrent_spin.setRange(1, 32)
         self.concurrent_spin.setValue(self.scheduler.get_max_concurrent())
-        self.concurrent_spin.setToolTip("并发爬虫线程池大小，可运行时动态调整")
-        row1.addWidget(self.concurrent_spin)
-        row1.addSpacing(16)
-        row1.addWidget(QLabel("默认深度："))
-        self.depth_spin = QSpinBox()
-        self.depth_spin.setRange(0, 5)
-        self.depth_spin.setValue(1)
-        row1.addWidget(self.depth_spin)
-        row1.addSpacing(10)
-        row1.addWidget(QLabel("默认间隔："))
-        self.delay_spin = QDoubleSpinBox()
-        self.delay_spin.setRange(0.0, 10.0)
-        self.delay_spin.setSingleStep(0.1)
-        self.delay_spin.setValue(0.5)
-        self.delay_spin.setSuffix(" s")
-        row1.addWidget(self.delay_spin)
-        row1.addSpacing(10)
-        row1.addWidget(QLabel("默认字符："))
-        self.chars_spin = QSpinBox()
-        self.chars_spin.setRange(0, 10_000_000)
-        self.chars_spin.setSingleStep(10000)
-        row1.addWidget(self.chars_spin)
-        row1.addStretch()
-        cfg_lay.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        self.external_check = QCheckBox("允许站外链接")
-        row2.addWidget(self.external_check)
-        self.robots_check = QCheckBox("校验robots.txt")
-        self.robots_check.setChecked(True)
-        row2.addWidget(self.robots_check)
-        row2.addSpacing(10)
-        row2.addWidget(QLabel("默认重试次数："))
+        self.concurrent_spin.setToolTip("并发后台任务数上限，可运行时动态调整")
+        cfg_lay.addWidget(self.concurrent_spin)
+        cfg_lay.addSpacing(14)
+        cfg_lay.addWidget(QLabel("任务失败重试："))
         self.retries_spin = QSpinBox()
         self.retries_spin.setRange(0, 10)
         self.retries_spin.setValue(2)
-        row2.addWidget(self.retries_spin)
-        row2.addSpacing(10)
-        row2.addWidget(QLabel("下载根目录："))
-        self.download_dir_edit = QLineEdit(self.scheduler.base_download_dir)
-        row2.addWidget(self.download_dir_edit, 1)
-        browse_btn = QPushButton("浏览")
-        browse_btn.clicked.connect(self._on_browse_download_dir)
-        row2.addWidget(browse_btn)
-        row2.addSpacing(10)
+        self.retries_spin.setToolTip("任务级失败自动重试次数（媒体文件下载重试见「下载管理」页）")
+        cfg_lay.addWidget(self.retries_spin)
+        cfg_lay.addSpacing(14)
         self.save_queue_btn = QPushButton("保存队列")
-        self.save_queue_btn.setToolTip("将未完成任务保存到 task_data/task_queue.json（关闭时自动保存）")
+        self.save_queue_btn.setToolTip("将未完成任务保存到队列文件（关闭窗口时自动保存）")
         self.save_queue_btn.clicked.connect(self._on_save_queue)
-        row2.addWidget(self.save_queue_btn)
+        cfg_lay.addWidget(self.save_queue_btn)
         self.load_queue_btn = QPushButton("载入队列")
         self.load_queue_btn.setToolTip("从队列文件恢复未完成任务")
         self.load_queue_btn.clicked.connect(self._on_load_queue)
-        row2.addWidget(self.load_queue_btn)
-        cfg_lay.addLayout(row2)
+        cfg_lay.addWidget(self.load_queue_btn)
+        cfg_lay.addStretch()
         root.addWidget(cfg_box)
 
         # ---- 操作按钮 ----
@@ -533,12 +540,6 @@ class TaskManagerTab(QWidget):
         dlg = TaskCompareDialog(self, self.scheduler)
         dlg.exec()
 
-    def _on_browse_download_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择下载根目录", self.download_dir_edit.text())
-        if d:
-            self.download_dir_edit.setText(d)
-            self.scheduler.base_download_dir = d
-
     def _on_save_queue(self):
         self.scheduler.save_queue()
         QMessageBox.information(self, "保存队列",
@@ -554,7 +555,7 @@ class TaskManagerTab(QWidget):
 
     # ---------------- 汇总与时钟 ----------------
     def _main_media_config(self) -> dict:
-        """主窗口「爬取配置」页的媒体设置快照（可能为空字典）。"""
+        """主窗口「工具配置」页的媒体抓取设置快照（可能为空字典）。"""
         collector = getattr(self.main_window, "_collect_media_config", None)
         if collector is None:
             return {}
@@ -564,20 +565,38 @@ class TaskManagerTab(QWidget):
             return {}
 
     def _default_config(self) -> TaskConfig:
-        """全局默认配置：爬取参数 + 主窗口「爬取配置」页的媒体设置快照。
+        """全局默认配置：读取主窗口「爬取配置」页的控件（单一数据源）。
 
-        媒体设置的 ``enabled`` 字段在此不作为"是否媒体任务"的依据，
-        真正的任务类型由「添加任务」对话框的任务类型选择决定。
+        这样"深度/间隔/单页字符/站外链接/最大页数/定向关键词/抖动"只在一处维护，
+        任务面板不再重复一套同名控件；媒体设置同样取主窗口「工具配置」页的快照
+        （其 ``enabled`` 字段不作为任务类型依据，任务类型由添加对话框决定）。
         """
-        return TaskConfig(
-            media=self._main_media_config(),
-            max_depth=self.depth_spin.value(),
-            request_delay=self.delay_spin.value(),
-            max_chars_per_page=self.chars_spin.value(),
-            crawl_external=self.external_check.isChecked(),
-            robots_check=self.robots_check.isChecked(),
-            max_retries=self.retries_spin.value(),
-        )
+        cfg = TaskConfig(media=self._main_media_config(),
+                         max_retries=self.retries_spin.value())
+        window = self.main_window
+        if window is None:
+            return cfg
+        numeric = (("depth_spin", "max_depth"),
+                   ("delay_spin", "request_delay"),
+                   ("max_chars_spin", "max_chars_per_page"),
+                   ("max_pages_spin", "max_pages"),
+                   ("jitter_spin", "jitter"))
+        for widget_name, field_name in numeric:
+            widget = getattr(window, widget_name, None)
+            if widget is not None:
+                setattr(cfg, field_name, widget.value())
+        checkbox = getattr(window, "crawl_external_check", None)
+        if checkbox is not None:
+            cfg.crawl_external = checkbox.isChecked()
+        line_edit = getattr(window, "link_filter_input", None)
+        if line_edit is not None:
+            cfg.link_filter = line_edit.text().strip()
+        return cfg
+
+    def set_download_dir(self, directory: str) -> None:
+        """同步任务下载根目录（由主窗口「下载管理」页统一维护）。"""
+        if directory:
+            self.scheduler.base_download_dir = directory
 
     def _refresh_summary(self):
         s = self.scheduler.summary()
@@ -603,4 +622,7 @@ class TaskManagerTab(QWidget):
                     item.setText(fmt_duration(meta["duration"]))
 
 
-__all__ = ["TaskManagerTab"]
+#: 兼容旧名：原「任务管理」标签页更名为多任务队列面板（仅改名，能力不变）
+TaskManagerTab = TaskQueuePanel
+
+__all__ = ["TaskQueuePanel", "CollapsibleGroupBox", "TaskManagerTab"]
