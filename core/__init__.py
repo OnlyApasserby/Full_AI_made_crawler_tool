@@ -5,6 +5,14 @@
 - filter：URL 过滤规则 ``URLFilter``
 - parser：页面解析（提取链接 / 媒体 / 纯文字）
 - robots：robots.txt 解析与在线校验线程
+- security：广告/钓鱼链接识别与屏蔽正则生成
+- media：媒体领域层（类型识别 ``detector``、数据模型 ``models``、探测 ``probe``、
+  流媒体 ``hls`` / ``dash`` / ``merger``）
+- fetcher：统一抓取层（静态 requests / 动态 playwright）
+- extractor：媒体提取器插件体系（注册表 + 通用 HTML/JSON/网络监听提取器）
+- paginator：图集/列表翻页策略
+- pipeline：媒体去重与质量过滤流水线
+- media_crawler：媒体抓取编排线程 ``MediaCrawlThread``
 
 持久化（sqlite）集中在 manager/db_manager，本包通过它读写数据库。
 """

@@ -1,11 +1,14 @@
 """多任务管理（多目标网站并发爬取）—— 核心：任务调度器 + 合并导出。
 
 - 任务模型 / 优先级 / 依赖 / 队列持久化集中在 models 与本模块；
-- 并发控制：每个运行任务 = 独立 RecursiveCrawlerThread，运行时只保留
-  ``max_concurrent`` 个存活爬虫线程，其余按（优先级, ID）排队，容量释放后
+- 并发控制：每个运行任务 = 独立后台线程（递归爬取或媒体抓取），运行时只保留
+  ``max_concurrent`` 个存活线程，其余按（优先级, ID）排队，容量释放后
   自动补位 —— 等价于可动态调整的线程池；另用 manager.thread_manager 的
   QThreadPool 承载队列/结果文件等异步落盘。
-- 所有爬虫线程信号经队列连接回 GUI 线程处理，状态变化通过信号通知 UI。
+- 任务类型由 ``TaskConfig.media['enabled']`` 决定：
+  ``False`` → ``RecursiveCrawlerThread``（页面文字与链接）；
+  ``True``  → ``MediaCrawlThread``（图像/视频增强流程，支持渲染与 XHR 监听）。
+- 所有线程信号经队列连接回 GUI 线程处理，状态变化通过信号通知 UI。
 """
 
 from __future__ import annotations
@@ -20,6 +23,10 @@ from functools import partial
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
+from config import (
+    DEFAULT_DOWNLOAD_DIR, DEFAULT_MEDIA_PAGE_TIMEOUT, DEFAULT_TASK_DATA_DIR,
+    ROOT_DIR,
+)
 from models import (
     PRIORITY_TEXT, STATUS_TEXT, TaskConfig, TaskPriority, TaskStatus,
 )
@@ -27,9 +34,11 @@ from utils.helpers import now_str, sanitize_name, url_domain
 from utils.validators import valid_http_url
 from utils.user_agents import UserAgentPool
 from core.crawler import RecursiveCrawlerThread
+from core.media.models import MediaConfig
+from core.media_crawler import MediaCrawlThread
 from core.robots import RobotsCheckThread, RobotsParser
 from core.filter import URLFilter
-from manager.db_manager import configure_wal
+from manager.db_manager import configure_wal, ensure_schema, save_media_items
 from manager.thread_manager import ThreadPoolManager
 
 # 终态 / 需要持久化的状态集合（模块私有）
@@ -51,9 +60,11 @@ class TaskScheduler(QObject):
                  queue_file: str | None = None):
         super().__init__()
         self._lock = threading.RLock()
-        self.data_root = data_root or os.path.join(os.getcwd(), "task_data")
+        # 目录基准用应用目录（打包后为 exe 所在目录），避免依赖进程的当前工作目录
+        self.data_root = data_root or os.path.join(ROOT_DIR, DEFAULT_TASK_DATA_DIR)
         os.makedirs(self.data_root, exist_ok=True)
-        self.base_download_dir = base_download_dir or os.path.join(os.getcwd(), "downloads")
+        self.base_download_dir = base_download_dir or os.path.join(ROOT_DIR,
+                                                                  DEFAULT_DOWNLOAD_DIR)
         self.queue_file = queue_file or os.path.join(self.data_root, "task_queue.json")
 
         self.max_concurrent = max(1, int(max_concurrent))
@@ -173,7 +184,7 @@ class TaskScheduler(QObject):
                 "id": tid, "config": cfg, "name": name, "status": TaskStatus.PENDING,
                 "error": "", "retry_count": 0, "pages": 0, "current_depth": 0,
                 "progress": 0, "link_count": 0, "media_count": 0,
-                "texts": {}, "media_urls": [],
+                "texts": {}, "media_urls": [], "media_items": [],
                 "created_at": now_str(), "started_at": "", "finished_at": "", "duration": 0.0,
                 "crawler_task_id": None, "stopped_partial": False,
                 "task_dir": task_dir, "db_path": os.path.join(task_dir, "crawl_cache.db"),
@@ -410,6 +421,7 @@ class TaskScheduler(QObject):
             rec["progress"] = 0
             rec["texts"] = {}
             rec["media_urls"] = []
+            rec["media_items"] = []
             rec["started_at"] = ""
             rec["finished_at"] = ""
             rec["duration"] = 0.0
@@ -494,29 +506,79 @@ class TaskScheduler(QObject):
             cfg = rec["config"]
             task_filter = URLFilter(block_patterns=cfg.block_patterns,
                                     allow_domains=cfg.allow_domains)
-            thread = RecursiveCrawlerThread(
-                start_url=cfg.start_url, max_depth=cfg.max_depth,
-                crawl_external=cfg.crawl_external, request_delay=cfg.request_delay,
-                max_chars_per_page=cfg.max_chars_per_page, link_filter=cfg.link_filter,
-                db_path=rec["db_path"], ua_pool=self.ua_pool, jitter=cfg.jitter,
-                proxy=cfg.proxy or {}, url_filter=task_filter, max_pages=cfg.max_pages,
-                resume_task_id=rec["crawler_task_id"],
-            )
-            thread.signal_log.connect(partial(self._on_crawler_log, task_id))
-            thread.signal_finish.connect(partial(self._on_task_finish, task_id))
-            thread.signal_media_found.connect(partial(self._on_task_media, task_id))
-            thread.signal_progress.connect(partial(self._on_task_progress, task_id))
-            thread.signal_error.connect(partial(self._on_task_error, task_id))
-            thread.signal_stopped.connect(partial(self._on_task_stopped, task_id))
-            thread.finished.connect(partial(self._on_thread_finished, task_id))
+            if cfg.is_media_task:
+                thread, start_log = self._build_media_thread(rec, cfg, task_filter)
+            else:
+                thread, start_log = self._build_crawl_thread(rec, cfg, task_filter)
             self._running[task_id] = thread
             rec["status"] = TaskStatus.RUNNING
             rec["started_at"] = now_str()
-            self._log_task(task_id, f"启动爬虫线程：{cfg.start_url}（深度 {cfg.max_depth}，"
-                                    f"间隔 {cfg.request_delay}s，站外链接：{'允许' if cfg.crawl_external else '禁止'}）")
+            self._log_task(task_id, start_log)
             self.task_changed.emit(task_id)
             self.summary_changed.emit()
             thread.start()
+
+    def _build_crawl_thread(self, rec: dict, cfg: TaskConfig, task_filter) -> tuple:
+        """构建递归爬取线程并连接信号，返回 (线程, 启动日志)。"""
+        thread = RecursiveCrawlerThread(
+            start_url=cfg.start_url, max_depth=cfg.max_depth,
+            crawl_external=cfg.crawl_external, request_delay=cfg.request_delay,
+            max_chars_per_page=cfg.max_chars_per_page, link_filter=cfg.link_filter,
+            db_path=rec["db_path"], ua_pool=self.ua_pool, jitter=cfg.jitter,
+            proxy=cfg.proxy or {}, url_filter=task_filter, max_pages=cfg.max_pages,
+            resume_task_id=rec["crawler_task_id"],
+        )
+        task_id = rec["id"]
+        thread.signal_log.connect(partial(self._on_crawler_log, task_id))
+        thread.signal_finish.connect(partial(self._on_task_finish, task_id))
+        thread.signal_media_found.connect(partial(self._on_task_media, task_id))
+        thread.signal_progress.connect(partial(self._on_task_progress, task_id))
+        thread.signal_error.connect(partial(self._on_task_error, task_id))
+        thread.signal_stopped.connect(partial(self._on_task_stopped, task_id))
+        thread.finished.connect(partial(self._on_thread_finished, task_id))
+        log_text = (f"启动递归爬取：{cfg.start_url}（深度 {cfg.max_depth}，"
+                    f"间隔 {cfg.request_delay}s，"
+                    f"站外链接：{'允许' if cfg.crawl_external else '禁止'}）")
+        return thread, log_text
+
+    def _build_media_thread(self, rec: dict, cfg: TaskConfig,
+                            task_filter) -> tuple:
+        """构建媒体抓取线程并连接信号，返回 (线程, 启动日志)。
+
+        与爬虫线程的差异：``signal_progress`` / ``signal_finish`` /
+        ``signal_stopped`` 的参数含义不同（页面数 / 媒体数 / 统计），
+        因此使用独立的槽函数，避免语义串位。
+
+        注意：媒体线程自身不读写数据库（爬虫线程会在 ``_init_db`` 中建表），
+        因此这里需要显式准备任务级表结构，否则媒体元信息无法入库。
+        """
+        task_id = rec["id"]
+        try:
+            ensure_schema(rec["db_path"])
+        except Exception:
+            pass
+        config = MediaConfig.from_dict(cfg.media)
+        max_chars = max(0, int(cfg.max_chars_per_page or 0))
+        thread = MediaCrawlThread(
+            start_url=cfg.start_url, config=config,
+            request_delay=cfg.request_delay, jitter=cfg.jitter,
+            proxy=cfg.proxy or {}, ua_pool=self.ua_pool,
+            url_filter=task_filter, page_timeout=DEFAULT_MEDIA_PAGE_TIMEOUT,
+            max_page_bytes=max_chars * 4 if max_chars > 0 else 0,
+        )
+        thread.signal_log.connect(partial(self._on_crawler_log, task_id))
+        thread.signal_page_done.connect(partial(self._on_media_page_done, task_id))
+        thread.signal_media_found.connect(partial(self._on_task_media, task_id))
+        thread.signal_media_items.connect(partial(self._on_media_task_items, task_id))
+        thread.signal_progress.connect(partial(self._on_media_task_progress, task_id))
+        thread.signal_finish.connect(partial(self._on_media_task_finish, task_id))
+        thread.signal_stopped.connect(partial(self._on_media_task_stopped, task_id))
+        thread.signal_error.connect(partial(self._on_task_error, task_id))
+        thread.finished.connect(partial(self._on_thread_finished, task_id))
+        log_text = (f"启动媒体抓取：{cfg.start_url}"
+                    f"（目标 {'/'.join(config.target_kinds())}，"
+                    f"模式 {config.render_mode}，页数上限 {config.max_pages or '不限'}）")
+        return thread, log_text
 
     # ---------------- 爬虫信号 ----------------
     def _on_crawler_log(self, task_id: int, msg: str):
@@ -543,12 +605,18 @@ class TaskScheduler(QObject):
             self.task_changed.emit(tid)
 
     def _on_task_media(self, task_id: int, media: list):
+        """任务媒体资源更新（爬取中逐页推送）：写入任务记录并刷新表格与汇总。"""
         with self._lock:
             rec = self.tasks.get(task_id)
             if rec is None:
                 return
             rec["media_urls"] = list(media)
             rec["media_count"] = len(media)
+        # 与进度刷新共用节流定时器，避免逐页重绘；媒体总数变化同步更新汇总统计
+        self._refresh_ids.add(task_id)
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+        self.summary_changed.emit()
 
     def _on_task_finish(self, task_id: int, pages: int, links: list, texts: dict):
         with self._lock:
@@ -585,6 +653,105 @@ class TaskScheduler(QObject):
             running = self._running.get(task_id)
             rec["crawler_task_id"] = getattr(running, "task_id", rec["crawler_task_id"])
         self._log_task(task_id, f"任务已停止（已爬 {pages} 页），可从断点继续")
+
+    # ---------------- 媒体抓取信号（参数语义与爬虫线程不同） ----------------
+    def _on_media_page_done(self, task_id: int, page_url: str, info: str):
+        """媒体抓取的单页结果：写入任务日志。"""
+        self._log_task(task_id, f"[{page_url}] {info}")
+
+    def _on_media_task_items(self, task_id: int, items: list):
+        """媒体项列表更新：写入任务记录（落盘统一在结束/停止时进行）。"""
+        with self._lock:
+            rec = self.tasks.get(task_id)
+            if rec is None:
+                return
+            rec["media_items"] = list(items)
+            rec["media_count"] = len(items)
+            self._refresh_ids.add(task_id)
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start()
+        self.summary_changed.emit()
+
+    def _on_media_task_progress(self, task_id: int, pages: int, media_count: int,
+                                pending: int):
+        """媒体抓取进度：页面数 / 媒体数 / 待抓队列。
+
+        媒体抓取没有"层"的概念，进度按"已抓页面数 ÷ 页数上限"近似；
+        未设置页数上限时保持 0（不虚构进度）。
+        """
+        with self._lock:
+            rec = self.tasks.get(task_id)
+            if rec is None:
+                return
+            rec["pages"] = int(pages)
+            rec["media_count"] = int(media_count)
+            rec["current_depth"] = int(pending)     # 复用字段展示"待抓页面"
+            limit = int((rec["config"].media or {}).get("max_pages") or 0)
+            if limit > 0:
+                rec["progress"] = min(99, int(round(pages / limit * 100)))
+            self._refresh_ids.add(task_id)
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start()
+
+    def _on_media_task_finish(self, task_id: int, pages: int, media_count: int,
+                              stats: str):
+        """媒体抓取完成：入库媒体元信息 + 结果快照并置为已完成。"""
+        self._finalize_media_task(task_id, pages, media_count, stats,
+                                  completed=True)
+
+    def _on_media_task_stopped(self, task_id: int, pages: int, media_count: int,
+                               stats: str):
+        """媒体抓取被手动停止：同样保留已发现结果。"""
+        self._finalize_media_task(task_id, pages, media_count, stats,
+                                  completed=False)
+
+    def _finalize_media_task(self, task_id: int, pages: int, media_count: int,
+                             stats: str, completed: bool):
+        """媒体任务收尾：状态迁移 + 媒体元信息落盘 + 结果快照。"""
+        with self._lock:
+            rec = self.tasks.get(task_id)
+            if rec is None:
+                return
+            rec["status"] = TaskStatus.COMPLETED if completed else TaskStatus.PAUSED
+            rec["pages"] = int(pages)
+            rec["media_count"] = int(media_count)
+            rec["media_stats"] = str(stats)
+            rec["progress"] = 100 if completed else rec.get("progress", 0)
+            rec["finished_at"] = now_str()
+            rec["duration"] = self._elapsed_since(rec)
+            if not completed:
+                rec["stopped_partial"] = True
+            items = list(rec.get("media_items", []))
+            db_path = rec["db_path"]
+        if items:
+            try:
+                # 任务级数据库，与主库隔离；带 task_id 便于按任务查询
+                save_media_items(db_path, items, task_id=task_id)
+            except Exception:
+                pass
+        self._write_media_results_async(rec, items, stats)
+        if completed:
+            self._log_task(task_id, f"任务完成：抓取 {pages} 个页面，"
+                                    f"{media_count} 个媒体资源 | {stats}")
+            self._mark_terminal(task_id)
+        else:
+            self._log_task(task_id, f"任务已停止（已抓 {pages} 个页面，"
+                                    f"{media_count} 个媒体资源），结果已保留")
+            self.task_changed.emit(task_id)
+            self.summary_changed.emit()
+
+    def _write_media_results_async(self, rec: dict, items: list, stats: str):
+        """异步写入媒体任务结果快照（结构区别于爬虫任务的 links/texts）。"""
+        snapshot = {
+            "task_id": rec["id"], "task_name": rec["name"], "type": "media",
+            "start_url": rec["config"].start_url, "finished_at": now_str(),
+            "stats": stats,
+            "media_count": len(items),
+            "media_urls": [item.url for item in items if hasattr(item, "url")],
+            "media_items": [item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                            for item in items],
+        }
+        self._io_pool.submit(partial(self._dump_json, rec["results_path"], snapshot))
 
     def _on_task_error(self, task_id: int, err: str):
         self._log_task(task_id, f"任务出错：{err}")
@@ -768,7 +935,7 @@ class TaskScheduler(QObject):
                         "retry_count": int(item.get("retry_count", 0)),
                         "pages": 0, "current_depth": 0, "progress": 0,
                         "link_count": 0, "media_count": 0,
-                        "texts": {}, "media_urls": [],
+                        "texts": {}, "media_urls": [], "media_items": [],
                         "created_at": item.get("created_at", "") or now_str(),
                         "started_at": "", "finished_at": "", "duration": 0.0,
                         "crawler_task_id": item.get("crawler_task_id"),

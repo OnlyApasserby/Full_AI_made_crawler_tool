@@ -2,5 +2,19 @@
 PyQt6>=6.4
 requests>=2.28
 
-# 可选：图片压缩/处理（缺失时相关功能自动降级，不影响主流程）
+# 动态渲染与网络（XHR）监听：图像/视频通用化抓取的核心依赖
+# 安装后还需下载浏览器内核：playwright install chromium
+playwright>=1.40
+
+# 可选：图片压缩/处理、尺寸探测与感知哈希去重（缺失时相关功能自动降级，不影响主流程）
 Pillow>=9.0
+
+# 可选：HLS 分片 AES-128 解密（缺失时加密流合并功能不可用，其余功能不受影响）
+# pycryptodome>=3.18
+
+# 可选：站点规则提取器使用 CSS 选择器解析（缺失时自动退回正则模式）
+# beautifulsoup4>=4.11
+# lxml>=4.9
+
+# 可选：打包为单个 exe（pip install pyinstaller 后执行 pyinstaller crawler.spec）
+# pyinstaller>=6.10

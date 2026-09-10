@@ -4,6 +4,7 @@
 - crawled_urls：已爬 URL（URL哈希去重，含任务ID，供断点续爬）
 - crawl_tasks：每次爬取任务记录（status=running 表示未完成）
 - media_downloads：媒体下载状态记录
+- media_items：媒体抓取发现的资源（含分辨率/时长/合集等元信息）
 
 本模块只依赖标准库，供 core（爬虫/下载器）与 manager / ui 层共用，
 因此没有对上层模块的引用，不会形成循环导入。
@@ -62,6 +63,28 @@ def ensure_schema(db_path: str) -> None:
             downloaded_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
         )
     """)
+    # 媒体抓取结果表：记录"发现了什么资源"，与"下载了什么"（media_downloads）分离，
+    # 便于过滤统计、导出清单与后续按分辨率/时长二次筛选
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS media_items (
+            url_hash    TEXT PRIMARY KEY,
+            url         TEXT NOT NULL,
+            kind        TEXT DEFAULT '',
+            source_page TEXT DEFAULT '',
+            album       TEXT DEFAULT '',
+            title       TEXT DEFAULT '',
+            seq         INTEGER DEFAULT 0,
+            width       INTEGER DEFAULT 0,
+            height      INTEGER DEFAULT 0,
+            duration    REAL DEFAULT 0,
+            size        INTEGER DEFAULT 0,
+            origin      TEXT DEFAULT '',
+            task_id     INTEGER DEFAULT 0,
+            found_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_media_items_task "
+                 "ON media_items (task_id)")
     conn.commit()
     # 旧版本数据库没有status/file_path/task_id列时自动补列
     cols = [row[1] for row in conn.execute("PRAGMA table_info(crawled_urls)").fetchall()]
@@ -186,6 +209,114 @@ def save_media_state(db_path: str, url: str, file_path: str, status: str) -> Non
 
 
 # ---------------------------------------------------------------------------
+# 媒体抓取结果（media_items）
+# ---------------------------------------------------------------------------
+def save_media_items(db_path: str, items, task_id=0) -> int:
+    """批量写入媒体抓取结果（内部容错），返回成功写入条数。
+
+    只接受带 ``url`` 属性的对象或字典；元信息（分辨率/时长/合集）一并入库，
+    供清单导出与后续按质量二次筛选。
+    """
+    rows = []
+    for item in items or []:
+        data = item if isinstance(item, dict) else getattr(item, "to_dict", None)
+        if callable(data):
+            data = data()
+        if not isinstance(data, dict):
+            continue
+        url = str(data.get("url") or "")
+        if not url:
+            continue
+        rows.append((
+            url_fingerprint(url), url, str(data.get("kind") or ""),
+            str(data.get("source_page") or ""), str(data.get("album") or ""),
+            str(data.get("title") or ""), int(data.get("index") or 0),
+            int(data.get("width") or 0), int(data.get("height") or 0),
+            float(data.get("duration") or 0.0), int(data.get("size") or 0),
+            str(data.get("origin") or ""), int(task_id or 0)))
+    if not rows:
+        return 0
+    try:
+        conn = _connect(db_path)
+        conn.executemany(
+            "INSERT OR REPLACE INTO media_items (url_hash, url, kind, source_page, "
+            "album, title, seq, width, height, duration, size, origin, task_id, found_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))",
+            rows)
+        conn.commit()
+        conn.close()
+        return len(rows)
+    except Exception:
+        return 0
+
+
+def load_media_items(db_path: str, task_id=None, limit: int = 0) -> list[dict]:
+    """读取媒体抓取结果（内部容错）。
+
+    :param task_id: 指定任务ID；None 表示不限任务
+    :param limit: 返回条数上限（0=不限）
+    :return: 字典列表，字段与 ``media_items`` 表一致（含 ``index`` 别名）
+    """
+    if not os.path.exists(db_path):
+        return []
+    sql = ("SELECT url, kind, source_page, album, title, seq, width, height, "
+           "duration, size, origin, task_id FROM media_items")
+    params: list = []
+    if task_id is not None:
+        sql += " WHERE task_id=?"
+        params.append(int(task_id))
+    sql += " ORDER BY album, seq"
+    if limit and limit > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    try:
+        conn = _connect(db_path)
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    keys = ("url", "kind", "source_page", "album", "title", "seq", "width",
+            "height", "duration", "size", "origin", "task_id")
+    result = []
+    for row in rows:
+        record = dict(zip(keys, row))
+        record["index"] = record.pop("seq")
+        result.append(record)
+    return result
+
+
+def count_media_items(db_path: str, task_id=None) -> int:
+    """统计媒体抓取结果条数（内部容错）。"""
+    if not os.path.exists(db_path):
+        return 0
+    sql = "SELECT COUNT(*) FROM media_items"
+    params: list = []
+    if task_id is not None:
+        sql += " WHERE task_id=?"
+        params.append(int(task_id))
+    try:
+        conn = _connect(db_path)
+        count = conn.execute(sql, params).fetchone()[0]
+        conn.close()
+        return int(count or 0)
+    except Exception:
+        return 0
+
+
+def clear_media_items(db_path: str) -> int:
+    """清空媒体抓取结果表，返回删除条数（内部容错）。"""
+    try:
+        conn = _connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM media_items").fetchone()[0]
+        conn.execute("DELETE FROM media_items")
+        conn.commit()
+        conn.close()
+        return int(count or 0)
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # 未完成任务查询（启动续爬检测，供主窗口使用）
 # ---------------------------------------------------------------------------
 def get_unfinished_tasks(db_path: str) -> list[dict]:
@@ -247,6 +378,7 @@ def configure_wal(db_path: str) -> None:
 __all__ = [
     "ensure_schema", "url_fingerprint", "load_visited_hashes", "create_crawl_task",
     "finish_crawl_task", "save_crawled_url", "save_media_state",
+    "save_media_items", "load_media_items", "count_media_items", "clear_media_items",
     "get_unfinished_tasks", "abandon_unfinished_tasks", "clear_crawled_records",
     "configure_wal",
 ]

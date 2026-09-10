@@ -2,3 +2,16 @@ __pycache__/
 *.db
 task_data/
 downloads/
+myenv/
+output/
+downloads/
+
+# PyInstaller 产物
+build/
+dist/
+*.spec.bak
+
+# 本地浏览器内核（体积大，不入库；由脚本解压或 playwright install 提供）
+resources/browsers/
+chrome-win64.zip
+chrome-win32.zip

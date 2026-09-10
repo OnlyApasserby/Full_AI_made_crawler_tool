@@ -28,29 +28,89 @@ def extract_links(html_content: str, base_url: str) -> set[str]:
     return absolute_links
 
 
+# 媒体文件扩展名（用于筛选 a[href] / link / JS 内嵌直链，避免把普通链接当媒体）
+MEDIA_EXT_PATTERN = (
+    r"\.(?:mp4|m4v|mov|webm|mkv|avi|flv|f4v|wmv|mpg|mpeg|3gp|rmvb|m3u8|"
+    r"mp3|m4a|aac|flac|ogg|oga|opus|wav|wma)"
+)
+MEDIA_EXT_RE = re.compile(MEDIA_EXT_PATTERN + r"(?:[?#]|$)", re.IGNORECASE)
+# 可直接取用的媒体地址属性（含常见懒加载/播放器属性）
+_MEDIA_SRC_ATTR = (r"(?:src|data-src|data-original|data-lazy-src|data-url|"
+                   r"data-video|data-video-src|data-mp4|data-source)")
+
+
 def extract_media_links(html_content: str, base_url: str) -> set[str]:
     """从HTML中提取图片/视频/音频等媒体资源链接。
 
-    覆盖 img/video/audio/source 的 src、data-src、srcset 属性。
+    覆盖范围：
+    - img/video/audio/source/embed 的 src、data-src、data-original、data-lazy-src、
+      data-url、data-video、data-video-src、data-mp4、data-source 等属性
+    - img/video 的 poster、srcset/data-srcset（多候选取第一个）
+    - a[href]、link[rel=preload as=video/audio]、meta[og:video] 指向的媒体直链
+    - JS/JSON 内嵌的视频/音频直链（如 "url":"https://.../v.mp4"、"....m3u8?k=v"）
     """
-    media = set()
-    patterns = [
-        r'<img[^>]+src\s*=\s*["\']([^"\']+)["\']',
-        r'<img[^>]+data-src\s*=\s*["\']([^"\']+)["\']',
-        r'<img[^>]+srcset\s*=\s*["\']([^"\']+)["\']',
-        r'<video[^>]+src\s*=\s*["\']([^"\']+)["\']',
-        r'<audio[^>]+src\s*=\s*["\']([^"\']+)["\']',
-        r'<source[^>]+src\s*=\s*["\']([^"\']+)["\']',
-        r'<source[^>]+data-src\s*=\s*["\']([^"\']+)["\']',
-    ]
-    for pat in patterns:
-        for m in re.finditer(pat, html_content, re.IGNORECASE):
-            raw = m.group(1).strip()
-            # srcset可能包含多个候选地址（用逗号分隔），只取第一个
-            first = raw.split(",")[0].strip().split(" ")[0]
-            full_url = urljoin(base_url, first)
-            if full_url.startswith(('http://', 'https://')):
-                media.add(full_url)
+    media: set[str] = set()
+
+    def _add(raw: str, require_media_ext: bool = False) -> None:
+        candidate = html.unescape((raw or "").strip())
+        if not candidate or candidate.lower().startswith(
+                ("data:", "blob:", "javascript:", "about:", "#")):
+            return
+        # srcset 可能包含多个候选地址（逗号/空格分隔），只取第一个
+        candidate = candidate.split(",")[0].strip().split(" ")[0]
+        full_url = urljoin(base_url, candidate)
+        if not full_url.startswith(("http://", "https://")):
+            return
+        if require_media_ext and not MEDIA_EXT_RE.search(full_url):
+            return
+        media.add(full_url)
+
+    # 1. 媒体标签的地址属性（含懒加载属性）
+    for tag in ("img", "video", "audio", "source", "embed"):
+        pattern = rf'<{tag}\b[^>]*\b{_MEDIA_SRC_ATTR}\s*=\s*["\']([^"\']+)["\']'
+        for m in re.finditer(pattern, html_content, re.IGNORECASE):
+            _add(m.group(1))
+
+    # 2. 封面图
+    for m in re.finditer(
+            r'<(?:img|video)\b[^>]*\b(?:poster|data-poster)\s*=\s*["\']([^"\']+)["\']',
+            html_content, re.IGNORECASE):
+        _add(m.group(1))
+
+    # 3. 多候选图（srcset）
+    for m in re.finditer(
+            r'<(?:img|source)\b[^>]*\b(?:srcset|data-srcset)\s*=\s*["\']([^"\']+)["\']',
+            html_content, re.IGNORECASE):
+        _add(m.group(1))
+
+    # 4. a[href] 指向媒体文件（视频下载页/种子页常见）
+    for m in re.finditer(r'<a\b[^>]*\bhref\s*=\s*["\']([^"\']+)["\']',
+                         html_content, re.IGNORECASE):
+        _add(m.group(1), require_media_ext=True)
+
+    # 5. link rel=preload as=video/audio
+    for m in re.finditer(r"<link\b[^>]*>", html_content, re.IGNORECASE):
+        tag = m.group(0)
+        if re.search(r'as\s*=\s*["\'](?:video|audio)["\']', tag, re.IGNORECASE):
+            href = re.search(r'href\s*=\s*["\']([^"\']+)["\']', tag, re.IGNORECASE)
+            if href:
+                _add(href.group(1))
+
+    # 6. meta og:video / twitter:player:stream
+    for m in re.finditer(
+            r'<meta\b[^>]*\b(?:property|name)\s*=\s*["\']'
+            r'(?:og:video(?::url|:secure_url)?|twitter:player:stream)["\'][^>]*>',
+            html_content, re.IGNORECASE):
+        content = re.search(r'content\s*=\s*["\']([^"\']+)["\']', m.group(0), re.IGNORECASE)
+        if content:
+            _add(content.group(1), require_media_ext=True)
+
+    # 7. JS/JSON 内嵌直链（视频站常见：播放地址写在脚本变量中）
+    for m in re.finditer(
+            rf'["\']((?:https?:)?//[^"\'\s<>]+?{MEDIA_EXT_PATTERN}(?:\?[^"\'\s<>]*)?)["\']',
+            html_content, re.IGNORECASE):
+        _add(m.group(1))
+
     return media
 
 

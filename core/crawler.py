@@ -22,7 +22,7 @@ from urllib.parse import urlparse
 import requests
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from core.parser import extract_links, extract_media_links, extract_text
+from core.parser import extract_links, extract_media_links, extract_text, MEDIA_EXT_RE
 from core.filter import URLFilter
 from utils.user_agents import UserAgentPool
 from manager.db_manager import (
@@ -200,6 +200,33 @@ class RecursiveCrawlerThread(QThread):
         """返回是否已请求停止（供爬取循环检查点使用）"""
         return self._stop_event.is_set()
 
+    # ---------- 媒体资源识别与实时上报 ----------
+    @staticmethod
+    def _is_media_direct_url(url):
+        """按URL路径扩展名判断是否为媒体直链（.mp4/.m3u8/.mp3 等）"""
+        try:
+            return bool(MEDIA_EXT_RE.search(urlparse(url).path))
+        except Exception:
+            return False
+
+    def _report_media(self, new_urls, source=""):
+        """把新发现的媒体资源立即上报（日志 + 信号），返回本次新增数量。
+
+        媒体资源不分页面/直链来源，统一进入 self.media_urls 并推送全量快照，
+        使进度日志与下载管理列表即时可见（结束/停止/异常时同样会推送最终快照）。
+        """
+        added = [u for u in new_urls if u and u not in self.media_urls]
+        if not added:
+            return 0
+        self.media_urls.update(added)
+        preview = "、".join(sorted(added)[:2])
+        suffix = " 等" if len(added) > 2 else ""
+        tag = f"｜{source}" if source else ""
+        self.signal_log.emit(
+            f"🎬 发现 {len(added)} 个新媒体资源（累计 {len(self.media_urls)}）{tag}：{preview}{suffix}")
+        self.signal_media_found.emit(list(self.media_urls))
+        return len(added)
+
     # ---------- 主流程 ----------
     def run(self):
         try:
@@ -216,6 +243,7 @@ class RecursiveCrawlerThread(QThread):
                     break
                 self._pause_event.wait()
                 self.signal_log.emit(f"\n===== 开始爬取第 {depth} 层页面 =====")
+                self.signal_log.emit(f"　　本层候选页面：{len(current_level_urls)} 个")
                 next_level_urls = set()
 
                 for url in current_level_urls:
@@ -231,8 +259,19 @@ class RecursiveCrawlerThread(QThread):
                         continue
 
                     # URL过滤规则（共享URLFilter实例，白名单/正则规则实时生效）
+                    # 先按 should_fetch 判定（含过滤统计），再取原因用于日志，便于定位误过滤
                     if not self.url_filter.should_fetch(url):
-                        self.signal_log.emit(f"被URL过滤规则拦截，跳过: {url}")
+                        _allowed, reason = self.url_filter.explain(url)
+                        self.signal_log.emit(f"⛔ 被URL过滤规则拦截（{reason}），跳过: {url}")
+                        continue
+
+                    # 媒体直链（如 .mp4/.m3u8）：直接登记为媒体资源，不再当HTML页面解析
+                    if self._is_media_direct_url(url):
+                        self.visited_urls.add(url)
+                        self._save_crawled(url)
+                        self.signal_log.emit("　→ URL为媒体直链（扩展名识别），已登记为媒体资源")
+                        self._report_media([url], "URL扩展名识别")
+                        self.signal_progress.emit(len(self.visited_urls), depth, self.max_depth)
                         continue
 
                     try:
@@ -250,6 +289,19 @@ class RecursiveCrawlerThread(QThread):
                                             proxies=self.proxy, timeout=10, stream=True)
                         with self._response_lock:
                             self._current_response = resp
+                        raw_ctype = (resp.headers.get("Content-Type") or "").strip()
+                        content_type = raw_ctype.split(";")[0].strip().lower()
+                        # 响应类型为媒体（无扩展名的接口式直链）：直接登记，避免大文件被当页面读入内存
+                        if content_type.startswith(("video/", "audio/", "image/")):
+                            status = resp.status_code
+                            resp.close()
+                            with self._response_lock:
+                                self._current_response = None
+                            self.signal_log.emit(
+                                f"　→ HTTP {status} | {raw_ctype or '未知类型'} → 媒体直链，已登记")
+                            self._report_media([url], f"响应类型 {content_type}")
+                            self.signal_progress.emit(len(self.visited_urls), depth, self.max_depth)
+                            continue
                         truncated = False
                         limit_bytes = self.max_chars_per_page * 4 if self.max_chars_per_page > 0 else 0  # UTF-8最多4字节/字符
                         chunks = []
@@ -292,12 +344,15 @@ class RecursiveCrawlerThread(QThread):
                         page_media = extract_media_links(page_html, url)
                         page_text = extract_text(page_html)
                         self.all_extracted_links.update(page_links)
-                        self.media_urls.update(page_media)
                         self.page_contents[url] = page_text
-                        done_info = f"页面字符数：{len(page_html)}，提取到链接数：{len(page_links)}，媒体资源数：{len(page_media)}"
+                        done_info = (f"HTTP {resp.status_code}，类型 {raw_ctype or '未知'}，"
+                                     f"页面字符数：{len(page_html)}，提取到链接数：{len(page_links)}，"
+                                     f"媒体资源数：{len(page_media)}")
                         if truncated:
                             done_info += "（已超过单页上限，内容被截断）"
                         self.signal_single_page_done.emit(url, done_info)
+                        # 媒体资源实时上报（有新增才推送，日志与下载管理即时可见）
+                        self._report_media(page_media, "页面解析")
                         self.signal_progress.emit(len(self.visited_urls), depth, self.max_depth)
 
                         # 爬取成功后写入数据库，供下次重启跳过
@@ -330,10 +385,20 @@ class RecursiveCrawlerThread(QThread):
                     stopped = True
                 if stopped or reached_limit:
                     break
+                self.signal_log.emit(
+                    f"第 {depth} 层完成：累计页面 {len(self.visited_urls)} 个，"
+                    f"链接 {len(self.all_extracted_links)} 条，下一层候选 {len(next_level_urls)} 个")
                 current_level_urls = next_level_urls
                 if not current_level_urls:
                     self.signal_log.emit("没有更多可爬取的新链接，爬取提前结束")
                     break
+
+            # 汇总日志：确认抓取与媒体收集结果（便于快速定位“未显示媒体”类问题）
+            self.signal_log.emit(
+                f"📊 爬取汇总：页面 {len(self.visited_urls)} 个 | 链接 {len(self.all_extracted_links)} 条 | "
+                f"媒体 {len(self.media_urls)} 个")
+            if self.media_urls:
+                self.signal_log.emit("　→ 媒体资源已同步至【下载管理】列表，点击「开始下载」即可保存到本地")
 
             # 结束分支处理：
             if stopped:
@@ -344,13 +409,15 @@ class RecursiveCrawlerThread(QThread):
             else:
                 if reached_limit:
                     self.signal_log.emit(f"⏹ 已到达最大爬取页数({self.max_pages})，自动停止")
-                # 正常/自动停止：标记completed，并回传媒体资源列表
-                self._finish_task()
+                # 先回传媒体资源再标记任务完成：即使标记失败，已发现的媒体也不会丢失
                 self.signal_media_found.emit(list(self.media_urls))
+                self._finish_task()
                 self.signal_finish.emit(len(self.visited_urls), list(self.all_extracted_links), self.page_contents)
 
         except Exception as e:
-            # 异常时不标记任务完成，保留running状态以便下次续爬
+            # 异常时不标记任务完成，保留running状态以便下次续爬；
+            # 同时把已发现的媒体资源交给UI，避免异常导致下载管理为空
+            self.signal_media_found.emit(list(self.media_urls))
             self.signal_error.emit(f"递归爬取异常：{str(e)}")
 
 

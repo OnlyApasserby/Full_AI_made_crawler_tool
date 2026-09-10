@@ -18,12 +18,20 @@ from PyQt6.QtWidgets import (
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from config import DEFAULT_MEDIA_MAX_PAGES, DEFAULT_MEDIA_MAX_SCROLL
 from core.filter import URLFilter
+from core.media.models import (
+    RENDER_AUTO, RENDER_DYNAMIC, RENDER_STATIC, MediaConfig,
+)
 from models import (
     PRIORITY_TEXT, STATUS_COLORS, TaskConfig, TaskPriority, TaskStatus,
 )
 from utils.helpers import fmt_duration, now_str
 from manager.task_manager import TaskScheduler, export_tasks_to_file
+
+#: 任务类型取值（TaskConfig.media['enabled'] 的界面表达）
+TASK_TYPE_CRAWL = "crawl"
+TASK_TYPE_MEDIA = "media"
 
 
 def _exists_color(hex_color: str) -> QColor:
@@ -336,6 +344,40 @@ class TaskAddDialog(QDialog):
 
         form = QVBoxLayout()
         form.setSpacing(4)
+
+        # 任务类型：递归爬取（页面文字与链接） / 媒体抓取（图像与视频）
+        row0 = QHBoxLayout()
+        row0.addWidget(QLabel("任务类型："))
+        self.task_type_combo = QComboBox()
+        self.task_type_combo.addItem("递归爬取（页面文字与链接）", TASK_TYPE_CRAWL)
+        self.task_type_combo.addItem("媒体抓取（图像 / 视频）", TASK_TYPE_MEDIA)
+        self.task_type_combo.setToolTip(
+            "媒体抓取：静态+浏览器渲染双模式，支持懒加载/图集翻页/XHR 监听，\n"
+            "并做去重与质量过滤；详细选项可在「爬取配置」页先调好再用全局默认配置")
+        self.task_type_combo.currentIndexChanged.connect(self._toggle_media_options)
+        row0.addWidget(self.task_type_combo)
+        row0.addSpacing(10)
+        self.media_image_check = QCheckBox("图片")
+        self.media_image_check.setChecked(True)
+        self.media_video_check = QCheckBox("视频")
+        self.media_video_check.setChecked(True)
+        row0.addWidget(self.media_image_check)
+        row0.addWidget(self.media_video_check)
+        row0.addSpacing(10)
+        self.media_mode_combo = QComboBox()
+        self.media_mode_combo.addItem("自动", RENDER_AUTO)
+        self.media_mode_combo.addItem("仅静态", RENDER_STATIC)
+        self.media_mode_combo.addItem("浏览器渲染", RENDER_DYNAMIC)
+        row0.addWidget(self.media_mode_combo)
+        row0.addSpacing(10)
+        row0.addWidget(QLabel("页数上限："))
+        self.media_pages_spin = QSpinBox()
+        self.media_pages_spin.setRange(0, 200)
+        self.media_pages_spin.setValue(DEFAULT_MEDIA_MAX_PAGES)
+        row0.addWidget(self.media_pages_spin)
+        row0.addStretch()
+        form.addLayout(row0)
+
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("深度："))
         self.depth_spin = QSpinBox()
@@ -440,6 +482,7 @@ class TaskAddDialog(QDialog):
 
     def _load_defaults(self):
         d = self.defaults
+        self._load_media_fields(MediaConfig.from_dict(getattr(d, "media", None) or {}))
         self.depth_spin.setValue(d.max_depth)
         self.delay_spin.setValue(d.request_delay)
         self.chars_spin.setValue(d.max_chars_per_page)
@@ -454,16 +497,63 @@ class TaskAddDialog(QDialog):
         self._toggle_custom(self.global_radio.isChecked())
         self.global_radio.toggled.connect(self._toggle_custom)
 
+    def _load_media_fields(self, media: MediaConfig) -> None:
+        """按媒体配置初始化任务类型与媒体选项。"""
+        self.task_type_combo.setCurrentIndex(
+            1 if media.enabled else 0)
+        kinds = media.target_kinds()
+        self.media_image_check.setChecked("image" in kinds)
+        self.media_video_check.setChecked("video" in kinds)
+        index = self.media_mode_combo.findData(media.render_mode)
+        if index >= 0:
+            self.media_mode_combo.setCurrentIndex(index)
+        self.media_pages_spin.setValue(media.max_pages)
+        self._toggle_media_options()
+
+    def _toggle_media_options(self, *args) -> None:
+        """媒体专有选项仅在「媒体抓取 + 自定义配置」时可用。"""
+        use_media = self.task_type_combo.currentData() == TASK_TYPE_MEDIA
+        custom = not self.global_radio.isChecked()
+        for widget in (self.media_image_check, self.media_video_check,
+                       self.media_mode_combo, self.media_pages_spin):
+            widget.setEnabled(use_media and custom)
+
+    def _media_payload(self) -> dict:
+        """构造任务级媒体配置；非媒体任务返回空字典。
+
+        全局配置模式下沿用主窗口「爬取配置」页的详细媒体设置，
+        自定义模式则用本对话框的少量选项覆盖关键字段（类型/模式/页数上限）。
+        """
+        if self.task_type_combo.currentData() != TASK_TYPE_MEDIA:
+            return {}
+        media = MediaConfig.from_dict(getattr(self.defaults, "media", None) or {})
+        media.enabled = True
+        if not self.global_radio.isChecked():
+            kinds = []
+            if self.media_image_check.isChecked():
+                kinds.append("image")
+            if self.media_video_check.isChecked():
+                kinds.append("video")
+            media.kinds = kinds or ["image"]
+            media.render_mode = self.media_mode_combo.currentData() or RENDER_AUTO
+            media.max_pages = self.media_pages_spin.value()
+            media.scroll = True
+            media.max_scroll = media.max_scroll or DEFAULT_MEDIA_MAX_SCROLL
+            media.follow_pagination = True
+        return media.to_dict()
+
     def _toggle_custom(self, use_global: bool):
         # 优先级与依赖任务与配置来源无关，始终可设置
         for w in (self.depth_spin, self.delay_spin, self.chars_spin, self.external_check,
                   self.robots_check, self.max_pages_spin, self.retries_spin,
                   self.link_filter_edit, self.block_edit, self.domains_edit):
             w.setEnabled(not use_global)
+        self._toggle_media_options()
 
     def _load_edit(self, cfg: TaskConfig):
         self.global_radio.setChecked(False)
         self.global_radio.setEnabled(False)
+        self._load_media_fields(MediaConfig.from_dict(cfg.media or {}))
         self.depth_spin.setValue(cfg.max_depth)
         self.delay_spin.setValue(cfg.request_delay)
         self.chars_spin.setValue(cfg.max_chars_per_page)
@@ -499,6 +589,7 @@ class TaskAddDialog(QDialog):
             cfg.depends_on = depends
             cfg.block_patterns = list(self.global_patterns)  # 主窗口屏蔽规则快照（任务级）
             cfg.allow_domains = list(self.global_domains)
+            cfg.media = self._media_payload()
             return cfg
         return TaskConfig(
             start_url=url.strip(),
@@ -514,6 +605,7 @@ class TaskAddDialog(QDialog):
             depends_on=depends,
             block_patterns=[p for p in (p.strip() for p in self.block_edit.text().split(";")) if p],
             allow_domains=[d for d in (x.strip() for x in self.domains_edit.text().split(",")) if d],
+            media=self._media_payload(),
         )
 
     def _parse_depends(self) -> list[int]:

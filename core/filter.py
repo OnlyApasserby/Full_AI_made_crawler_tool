@@ -149,35 +149,42 @@ class URLFilter:
             return sorted(self._allow_domains)
 
     # ---------- 判定与统计 ----------
-    def should_fetch(self, url: str) -> bool:
-        """判断URL是否应被爬取。
+    def explain(self, url: str) -> tuple[bool, str]:
+        """判定URL是否放行并给出可读原因（只读判定，不改变过滤统计/样本）。
 
-        规则：先检查域名白名单（已配置时必须命中才放行），再检查正则屏蔽规则；
-        任一规则命中返回False。任何解析/匹配异常都视为放行，保证爬取不中断。
+        判定顺序与 should_fetch 一致：域名白名单 → 屏蔽正则。
+        :return: (是否放行, 原因描述)
         """
         try:
             host = urlparse(url).netloc.lower()
         except Exception:
             host = ""
+        with self._lock:
+            allow_domains = set(self._allow_domains)
+            compiled = list(self._block_compiled.items())
         # 1. 域名白名单：已配置时必须命中才放行
-        with self._lock:
-            if self._allow_domains:
-                allowed = any(host == d or host.endswith("." + d)
-                              for d in self._allow_domains)
-                if not allowed:
-                    self._record_filtered(url)
-                    return False
+        if allow_domains and not any(host == d or host.endswith("." + d)
+                                     for d in allow_domains):
+            return False, f"域名 {host or '未知'} 不在白名单内"
         # 2. 正则屏蔽规则：任一命中即过滤
-        with self._lock:
-            compiled = list(self._block_compiled.values())
-        for regex in compiled:
+        for pattern, regex in compiled:
             try:
                 if regex.search(url):
-                    self._record_filtered(url)
-                    return False
+                    return False, f"命中屏蔽正则：{pattern}"
             except re.error:
                 continue
-        return True
+        return True, (f"命中白名单域名 {host}" if allow_domains else "未命中任何屏蔽规则")
+
+    def should_fetch(self, url: str) -> bool:
+        """判断URL是否应被爬取。
+
+        规则与 explain 一致（先白名单、再屏蔽正则），被过滤时记录统计与样本。
+        任何解析/匹配异常都视为放行，保证爬取不中断。
+        """
+        allowed, _reason = self.explain(url)
+        if not allowed:
+            self._record_filtered(url)
+        return allowed
 
     def get_stats(self) -> dict:
         """返回过滤统计信息（副本，线程安全）。

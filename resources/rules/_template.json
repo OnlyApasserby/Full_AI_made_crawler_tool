@@ -1,0 +1,59 @@
+{
+  "_note": "规则模板（enabled=false，不会被加载生效）。复制为 <站点名>.json 后按需修改；本文件保留作为格式说明。",
+  "id": "example-gallery",
+  "name": "示例图库",
+  "enabled": false,
+  "priority": 50,
+  "match": {
+    "domain": ["example.com", "*.example.com"],
+    "url_regex": "/gallery/\\d+",
+    "exclude_url_regex": ""
+  },
+  "headers": {
+    "Referer": "https://www.example.com/"
+  },
+  "pagination": {
+    "strategy": "page_param",
+    "param": "page",
+    "template": "",
+    "start": 1,
+    "step": 1,
+    "max_pages": 20
+  },
+  "album": {
+    "selector": "h1.gallery-title",
+    "attr": "text"
+  },
+  "media": [
+    {
+      "selector": "img.gallery-photo",
+      "attr": "data-original",
+      "kind": "image",
+      "title_attr": "alt",
+      "upgrade": [["/thumb/", "/original/"], ["_small.", "."]]
+    },
+    {
+      "selector": "a.download-video",
+      "attr": "href",
+      "kind": "video"
+    },
+    {
+      "selector": "img.lazy",
+      "attr": "srcset",
+      "kind": "image"
+    }
+  ],
+  "regex": [
+    {
+      "pattern": "\"originalUrl\"\\s*:\\s*\"(https?://[^\"]+)\"",
+      "group": 1,
+      "kind": "image",
+      "ignore_case": true
+    }
+  ],
+  "detail_links": {
+    "selector": "div.photo-list a.item",
+    "attr": "href",
+    "pattern": "/photo/"
+  }
+}

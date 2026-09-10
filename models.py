@@ -71,6 +71,10 @@ class TaskConfig:
     proxy: dict = field(default_factory=dict)
     block_patterns: list = field(default_factory=list)  # 任务级屏蔽正则
     allow_domains: list = field(default_factory=list)   # 任务级域名白名单
+    #: 媒体抓取配置（``core.media.models.MediaConfig.to_dict()``）。
+    #: ``enabled=True`` 时本任务由 ``MediaCrawlThread`` 执行（图像/视频增强流程），
+    #: 否则走原有的 ``RecursiveCrawlerThread``。
+    media: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """转为可 JSON 序列化的字典（队列持久化用）。"""
@@ -83,7 +87,13 @@ class TaskConfig:
             "robots_check": self.robots_check, "priority": self.priority,
             "depends_on": list(self.depends_on), "proxy": dict(self.proxy),
             "block_patterns": list(self.block_patterns), "allow_domains": list(self.allow_domains),
+            "media": dict(self.media),
         }
+
+    @property
+    def is_media_task(self) -> bool:
+        """本任务是否走媒体抓取流程。"""
+        return bool((self.media or {}).get("enabled"))
 
     @classmethod
     def from_dict(cls, data: dict) -> "TaskConfig":
@@ -105,6 +115,7 @@ class TaskConfig:
             proxy=dict(data.get("proxy") or {}),
             block_patterns=[str(x) for x in (data.get("block_patterns") or [])],
             allow_domains=[str(x) for x in (data.get("allow_domains") or [])],
+            media=dict(data.get("media") or {}),
         )
 
 
@@ -112,15 +123,19 @@ class DownloadTask:
     """下载队列任务项：携带优先级，PriorityQueue 按 (priority, seq) 出队。
 
     优先级：页面图片等小资源(0) > 音频(1) > 文档(2) > 视频大文件(3) > 其他(4)。
+
+    ``item`` 为可选的 ``core.media.models.MediaItem``（延迟传入，不在此处 import，
+    保持本模块"只依赖标准库"的约定）；携带来源页与请求头等下载所需上下文。
     """
 
-    __slots__ = ("priority", "seq", "url", "max_retries")
+    __slots__ = ("priority", "seq", "url", "max_retries", "item")
 
-    def __init__(self, priority, seq, url, max_retries):
+    def __init__(self, priority, seq, url, max_retries, item=None):
         self.priority = priority
         self.seq = seq
         self.url = url
         self.max_retries = max_retries
+        self.item = item
 
     def __lt__(self, other):
         return (self.priority, self.seq) < (other.priority, other.seq)

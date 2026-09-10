@@ -553,8 +553,24 @@ class TaskManagerTab(QWidget):
         QMessageBox.information(self, "载入队列", f"已恢复 {n} 个任务（点击\"开始\"执行）")
 
     # ---------------- 汇总与时钟 ----------------
+    def _main_media_config(self) -> dict:
+        """主窗口「爬取配置」页的媒体设置快照（可能为空字典）。"""
+        collector = getattr(self.main_window, "_collect_media_config", None)
+        if collector is None:
+            return {}
+        try:
+            return collector().to_dict()
+        except Exception:
+            return {}
+
     def _default_config(self) -> TaskConfig:
+        """全局默认配置：爬取参数 + 主窗口「爬取配置」页的媒体设置快照。
+
+        媒体设置的 ``enabled`` 字段在此不作为"是否媒体任务"的依据，
+        真正的任务类型由「添加任务」对话框的任务类型选择决定。
+        """
         return TaskConfig(
+            media=self._main_media_config(),
             max_depth=self.depth_spin.value(),
             request_delay=self.delay_spin.value(),
             max_chars_per_page=self.chars_spin.value(),
