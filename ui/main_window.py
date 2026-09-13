@@ -58,6 +58,7 @@ from manager.db_manager import (
 from ui.export import (
     export_default_name, export_file_filter, write_export, write_media_export,
 )
+from ui.compliance_dialog import ComplianceDialog
 from ui.dialogs import ExportDialog, URLFilterDialog
 from ui.rule_dialog import SiteRuleDialog
 from ui.security_dialog import LinkGuardDialog
@@ -191,6 +192,15 @@ class CrawlerMainWindow(QMainWindow):
         self.start_check_btn = QPushButton("校验robots.txt")
         self.start_check_btn.clicked.connect(self.on_check_robots)
         param_layout.addWidget(self.start_check_btn)
+        # robots.txt 校验的扩展：扫描公开法律页面，整理需人工复核的条款线索
+        self.compliance_btn = QPushButton("合规辅助筛查…")
+        self.compliance_btn.setToolTip(
+            "扫描目标站点的公开法律/政策页面（服务条款、隐私政策、开发者协议等），\n"
+            "自动筛出与爬虫、自动化访问、数据采集、请求频率、API 使用、绕过限制\n"
+            "相关的条款并输出结构化报告（JSON / Markdown / HTML）。\n"
+            "仅作合规信息辅助筛查：不构成法律意见，不代替律师，也不判断能否抓取。")
+        self.compliance_btn.clicked.connect(self.on_compliance_check)
+        param_layout.addWidget(self.compliance_btn)
         layout.addLayout(param_layout)
 
         # 单页最大字符数 + 定向链接过滤
@@ -988,6 +998,36 @@ class CrawlerMainWindow(QMainWindow):
         else:
             thread.resume()
             self.log_display.append("▶ 已继续抓取")
+
+    def on_compliance_check(self):
+        """打开合规辅助筛查对话框（robots.txt 校验的扩展）。
+
+        该功能只扫描目标站点的**公开**法律/政策页面，整理出与爬虫、自动化访问、
+        数据采集、请求频率、API 使用、绕过限制相关的条款线索，输出结构化报告
+        供人工复核。它不构成法律意见，也不会改变爬取流程
+        （robots.txt 仍是唯一的硬性闸门，本报告不参与任何放行/阻断决策）。
+        """
+        start_url = self.url_input.text().strip()
+        if start_url and not start_url.startswith(("http://", "https://")):
+            QMessageBox.information(
+                self, "提示",
+                "当前填写的起始网址不是 http(s) 链接。\n"
+                "可在随后打开的对话框中重新填写要筛查的站点网址。")
+        dialog = ComplianceDialog(
+            self, start_url=start_url, ua_pool=self.ua_pool,
+            proxy=self._get_proxy_config(),
+            request_delay=self.delay_spin.value(),
+            jitter=self.jitter_spin.value(),
+            db_path=self.db_path)
+        dialog.exec()
+
+        report = dialog.report
+        if report is not None:
+            self.log_display.append(
+                f"合规辅助筛查完成：命中 {report.total_hits} 条线索"
+                f"（需人工复核，不构成法律意见）｜引擎：{report.engine}")
+            if report.report_path:
+                self.log_display.append(f"报告已留档：{report.report_path}")
 
     def on_check_robots(self):
         ok, err_msg = validate_url(self.url_input.text())

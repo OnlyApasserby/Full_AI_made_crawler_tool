@@ -13,6 +13,9 @@
 - paginator：图集/列表翻页策略
 - pipeline：媒体去重与质量过滤流水线
 - media_crawler：媒体抓取编排线程 ``MediaCrawlThread``
+- compliance：合规辅助筛查（robots.txt 校验的扩展）——扫描公开法律页面，
+  整理与爬虫/自动化访问/数据采集/请求频率/API/绕过限制相关的条款线索。
+  **只做合规线索筛查，不提供法律意见，也不判断能否抓取**（见 ``core/compliance/__init__.py``）
 
 持久化（sqlite）集中在 manager/db_manager，本包通过它读写数据库。
 """
