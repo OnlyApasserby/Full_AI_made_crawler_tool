@@ -87,6 +87,16 @@ def ensure_rules_dir() -> str:
     return path
 
 
+def ensure_compliance_dir() -> str:
+    """确保合规报告目录（resources/compliance）存在，返回其路径。
+
+    每次扫描的报告除入库外同时落盘为 JSON（便于留档与历史对比）。
+    """
+    path = os.path.join(ensure_resources_dir(), COMPLIANCE_DIRNAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # 默认爬取 / 下载参数（UI 控件初始值来源）
 # ---------------------------------------------------------------------------
@@ -136,6 +146,38 @@ DEFAULT_BROWSER_AUTO_EXTRACT = True    # 首次渲染时自动解压根目录的
 # 也可用环境变量显式指定可执行文件（优先级最高）
 BROWSER_EXECUTABLE_ENV = "CRAWLER_CHROME_PATH"
 
+# ---------------------------------------------------------------------------
+# 合规辅助筛查（robots.txt 校验的扩展；仅合规线索筛查，非法律意见）
+#
+# 扫描对象仅限目标站点的**公开**法律/政策页面；扫描自身也遵守 robots.txt，
+# 并保持"一页一秒左右"的礼貌间隔。报告只作为人工复核线索，不参与任何
+# 自动放行/阻断决策。
+# ---------------------------------------------------------------------------
+COMPLIANCE_DIRNAME = "compliance"        # 报告落盘目录：resources/compliance
+COMPLIANCE_MAX_PAGES = 12                # 单次扫描的法律页面数上限
+COMPLIANCE_SAME_HOST_ONLY = True         # 仅扫描同站点（同 host）页面
+COMPLIANCE_PAGE_DELAY = 1.0              # 页面抓取间隔（秒），礼貌抓取
+COMPLIANCE_PAGE_JITTER = 0.3             # 间隔随机抖动幅度
+COMPLIANCE_PAGE_TIMEOUT = 15.0           # 单页抓取超时（秒）
+COMPLIANCE_MAX_TEXT_CHARS = 200000       # 单页正文长度上限（防超大页面拖慢）
+COMPLIANCE_MIN_CONFIDENCE = 0.35         # 低于该置信度的命中不进入报告
+COMPLIANCE_MAX_FINDINGS = 200            # 报告条目数上限
+COMPLIANCE_RESPECT_ROBOTS = True         # 扫描自身也遵守 robots.txt
+COMPLIANCE_QUOTE_CHARS = 400             # 报告中单条引文的最大展示长度
+
+# LLM 辅助检测（chatanywhere，OpenAI 兼容接口）
+# 默认开启：一旦配置了 Key 即启用；未配置 Key / 调用失败时自动降级为纯本地检测。
+# 只发送候选条款文本片段（默认 top 30），不发送整页 HTML。
+LLM_ENABLED = True
+LLM_BASE_URL = "https://api.chatanywhere.tech/v1"
+LLM_MODEL = "gpt-4o-mini"
+LLM_API_KEY_ENV = "CHATANYWHERE_API_KEY"   # 环境变量优先；界面输入仅存内存
+LLM_TIMEOUT = 30.0
+LLM_MAX_RETRIES = 2
+LLM_MAX_CLAUSES = 30                     # 单次最多发送的候选条款数
+LLM_MAX_CHARS_PER_CLAUSE = 600           # 单条条款发送长度上限
+LLM_TEMPERATURE = 0.0
+
 __all__ = [
     "APP_NAME", "APP_VERSION", "CRAWLER_USER_AGENT",
     "DEFAULT_DB_FILENAME", "DEFAULT_DOWNLOAD_DIR", "DEFAULT_TASK_DATA_DIR",
@@ -144,7 +186,7 @@ __all__ = [
     "IS_FROZEN", "BUNDLE_DIR", "BUNDLED_RESOURCES_DIR", "BUNDLED_BROWSERS_DIR",
     "BUNDLED_RULES_DIR",
     "ensure_resources_dir", "ensure_browsers_dir", "ensure_rules_dir",
-    "default_db_path",
+    "ensure_compliance_dir", "default_db_path",
     "DEFAULT_MAX_DEPTH", "DEFAULT_REQUEST_DELAY", "DEFAULT_JITTER",
     "DEFAULT_MAX_PAGES", "DEFAULT_MAX_CHARS", "DEFAULT_LINK_FILTER",
     "DEFAULT_MAX_RETRIES", "DEFAULT_CRAWL_EXTERNAL",
@@ -160,4 +202,14 @@ __all__ = [
     "DEFAULT_MEDIA_MERGE_STREAM", "DEFAULT_MEDIA_FILENAME_TEMPLATE",
     "DEFAULT_MEDIA_RENDER_WORKERS", "DEFAULT_MEDIA_PAGE_TIMEOUT",
     "DEFAULT_MEDIA_PAGE_DELAY",
+    # 合规辅助筛查
+    "COMPLIANCE_DIRNAME", "COMPLIANCE_MAX_PAGES", "COMPLIANCE_SAME_HOST_ONLY",
+    "COMPLIANCE_PAGE_DELAY", "COMPLIANCE_PAGE_JITTER", "COMPLIANCE_PAGE_TIMEOUT",
+    "COMPLIANCE_MAX_TEXT_CHARS", "COMPLIANCE_MIN_CONFIDENCE",
+    "COMPLIANCE_MAX_FINDINGS", "COMPLIANCE_RESPECT_ROBOTS",
+    "COMPLIANCE_QUOTE_CHARS",
+    # LLM 辅助检测
+    "LLM_ENABLED", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY_ENV",
+    "LLM_TIMEOUT", "LLM_MAX_RETRIES", "LLM_MAX_CLAUSES",
+    "LLM_MAX_CHARS_PER_CLAUSE", "LLM_TEMPERATURE",
 ]

@@ -13,5 +13,11 @@ dist/
 
 # 本地浏览器内核（体积大，不入库；由脚本解压或 playwright install 提供）
 resources/browsers/
+# 合规辅助筛查报告留档（运行期生成，按站点与时间戳命名）
+resources/compliance/
 chrome-win64.zip
 chrome-win32.zip
+#一个图标
+craweler.ico
+#CodeBuddy的本地记忆
+.codebuddy/
