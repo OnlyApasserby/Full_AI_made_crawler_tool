@@ -13,6 +13,10 @@ LLM **只做两件事**：给候选条款打一个更贴切的分类标签、写
 数据外发范围：**只发送候选条款文本片段**（默认置信度最高的 30 条、每条截断到
 600 字符），不发送整页 HTML、不发送 Cookie/请求头。API Key 只从环境变量或
 内存读取，不落盘、不入库、不进报告。
+
+失败语义：任何异常都不向上抛。接口返回 403 / 404 等**确定性失败**时立即停止重试，
+返回一句可读原因（说明问题出在哪、该改哪个配置），本地关键词检测结果原样保留；
+只有 429 限流与 5xx 服务端错误才退避重试（见 :func:`describe_status`）。
 """
 
 from __future__ import annotations
@@ -51,6 +55,45 @@ TRIAGE_SYSTEM_PROMPT = """你是"合规信息辅助筛查"工具中的文本标�
 
 #: 单次请求的 payload 字符预算（超过则分片发送）
 REQUEST_CHAR_BUDGET = 12000
+
+# ---------------------------------------------------------------------------
+# 接口状态码 -> 可读原因
+#
+# 分工原则：
+# - **确定性失败**（4xx：鉴权、权限、地址、参数）重试没有意义，立即降级并返回
+#   明确原因，已完成的本地检测结果原样保留；
+# - **临时性失败**（429 限流、5xx 服务端错误）才值得退避重试。
+# 403/404 是典型的确定性失败：403 多为权限/来源/额度问题，404 多为接口地址配错，
+# 盲目重试只会白等；用户需要的是"为什么没成功、该改哪里"。
+# ---------------------------------------------------------------------------
+_STATUS_REASONS: dict[int, str] = {
+    400: "请求被接口拒绝（HTTP 400）：可能是模型名（config.LLM_MODEL）不正确或参数不被支持",
+    401: "鉴权失败（HTTP 401）：API Key 无效或已过期，请检查环境变量或界面输入",
+    403: "访问被拒绝（HTTP 403）：API Key 权限不足、来源受限，或额度/配额已用尽",
+    404: "接口地址不存在（HTTP 404）：请检查 config.LLM_BASE_URL 是否指向可用的 API 根地址",
+    405: "请求方法不被支持（HTTP 405）：config.LLM_BASE_URL 的路径层级可能多写或少写",
+    413: "请求体过大（HTTP 413）：可调小 config.LLM_MAX_CLAUSES 或 "
+         "config.LLM_MAX_CHARS_PER_CLAUSE",
+    422: "请求参数不被接受（HTTP 422）：请确认 config.LLM_MODEL 是该接口支持的模型名",
+}
+
+
+def describe_status(code: int) -> tuple:
+    """把接口状态码翻译成 (可读原因, 是否值得重试)。
+
+    403/404 等确定性失败返回 ``retryable=False``：调用方应直接降级，
+    保留本地检测结果并把这句原因展示给用户。
+    """
+    reason = _STATUS_REASONS.get(code)
+    if reason:
+        return reason, False
+    if code == 429:
+        return "触发接口限流（HTTP 429）", True
+    if code >= 500:
+        return f"接口服务端错误（HTTP {code}）", True
+    if code >= 400:
+        return f"请求被接口拒绝（HTTP {code}）", False
+    return f"接口返回异常状态（HTTP {code}）", False
 
 
 @dataclass
@@ -228,18 +271,20 @@ class LLMClient:
                     continue
                 return content or "", ""
 
-            # 鉴权/额度问题不值得重试，直接降级
-            if response.status_code in (401, 403):
-                return "", f"鉴权失败（HTTP {response.status_code}），请检查 API Key"
-            if response.status_code == 429:
-                last_error = f"第 {order}/{total} 批触发限流（HTTP 429）"
-                logger(f"{last_error}（第 {attempt} 次尝试）")
-                time.sleep(min(2.0 * attempt, 5.0))
-                continue
+            # 400 且携带 response_format：先摘掉该字段重试一次（部分兼容接口不支持）
             if response.status_code == 400 and "response_format" in payload:
                 return "", "response_format_unsupported"
-            last_error = f"第 {order}/{total} 批请求失败（HTTP {response.status_code}）"
-            logger(last_error)
+
+            reason, retryable = describe_status(response.status_code)
+            if not retryable:
+                # 确定性失败（含 403/404）：重试无意义，直接降级；
+                # 已完成的本地关键词结果原样保留，由上层写入报告的降级说明
+                logger(f"第 {order}/{total} 批{reason}；已跳过 LLM 标注，保留本地检测结果")
+                return "", reason
+
+            last_error = f"第 {order}/{total} 批{reason}"
+            logger(f"{last_error}（第 {attempt} 次尝试）")
+            time.sleep(min(2.0 * attempt, 5.0))
 
         return "", last_error or "未知错误"
 

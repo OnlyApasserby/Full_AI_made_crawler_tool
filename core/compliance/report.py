@@ -162,6 +162,12 @@ def render_markdown(report: ComplianceReport) -> str:
             state = page.error or (f"HTTP {page.status}" if page.status else "成功")
             out.append(f"| {page.url} | {state} | {page.chars} | {page.matched_by or '-'} |")
         out.append("")
+        failed = [page for page in report.pages if page.error]
+        if failed:
+            out += [f"> 上表中有 {len(failed)} 个页面未能读取（403 / 404 / 超时等）："
+                    "这些页面**未参与条款筛查**，本次线索均来自成功读取的页面，"
+                    "该情况**不影响已获得的结果**。如需覆盖它们，请改用可访问的条款入口，"
+                    "或适当增大抓取间隔后重试。", ""]
     if report.skipped:
         out += ["### 未扫描 / 被跳过的页面", "", "| 页面 | 原因 |", "| --- | --- |"]
         for item in report.skipped:
@@ -293,6 +299,12 @@ def render_html(report: ComplianceReport) -> str:
             parts.append(f"<tr><td>{_esc(page.url)}</td><td>{_esc(state)}</td>"
                          f"<td>{page.chars}</td><td>{_esc(page.matched_by or '-')}</td></tr>")
         parts.append("</table>")
+        failed = [page for page in report.pages if page.error]
+        if failed:
+            parts.append(f'<p class="note">上表中有 {len(failed)} 个页面未能读取'
+                         "（403 / 404 / 超时等）：这些页面<strong>未参与条款筛查</strong>，"
+                         "本次线索均来自成功读取的页面，<strong>不影响已获得的结果</strong>。"
+                         "如需覆盖它们，请改用可访问的条款入口，或适当增大抓取间隔后重试。</p>")
     if report.skipped:
         parts.append("<h2>附录 B：未扫描 / 被跳过的页面</h2>"
                      "<table><tr><th>页面</th><th>原因</th></tr>")

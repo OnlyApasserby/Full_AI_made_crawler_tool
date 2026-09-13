@@ -33,6 +33,32 @@ RENDER_FALLBACK_MIN_CHARS = 200
 #: 触发渲染兜底的页面数上限（浏览器成本高，宁愿少扫几页）
 RENDER_FALLBACK_MAX_PAGES = 2
 
+#: 页面级状态码 -> 可读原因。
+#: 403 / 404 在扫描过程中很常见（条款入口迁移、站点挡爬虫），
+#: 只记一句裸的 "HTTP 404" 无法判断该换入口还是该放慢节奏，因此统一翻译成
+#: "为什么没拿到"的说明；这类页面**只跳过自身**，不影响已成功页面的结果。
+_PAGE_STATUS_REASONS: dict[int, str] = {
+    401: "HTTP 401：该页面需要登录才能访问（本功能只扫描公开页面）",
+    403: "HTTP 403：站点拒绝访问该页面（可能启用了反爬校验或限制了访问来源）",
+    404: "HTTP 404：页面不存在，条款入口可能已迁移",
+    429: "HTTP 429：请求过于频繁被限流（可增大抓取间隔后重试）",
+    451: "HTTP 451：因法律原因不可访问",
+}
+
+
+def page_failure_reason(status: int, error: str = "") -> str:
+    """把页面抓取失败翻译成可读原因。
+
+    未列入对照表的状态码回退到抓取器给出的原始错误文本，
+    保证"原因"始终非空，便于在报告里如实交代该页为何未被纳入筛查。
+    """
+    reason = _PAGE_STATUS_REASONS.get(int(status or 0))
+    if reason:
+        return reason
+    if error:
+        return error
+    return f"HTTP {status}" if status else "抓取失败"
+
 
 class ComplianceScanThread(QThread):
     """合规辅助筛查后台线程。"""
@@ -162,8 +188,14 @@ class ComplianceScanThread(QThread):
         if ctx.html:
             return robots_url, RobotsParser(ctx.html), \
                 f"已获取 robots.txt（{len(ctx.html)} 字符）"
-        return robots_url, None, \
-            f"未获取到 robots.txt（{ctx.error or f'HTTP {ctx.status}'}）"
+        # robots.txt 的 403/404 很常见且不影响本次筛查，单独给出更准确的说法
+        if ctx.status == 404:
+            return robots_url, None, "该站点未提供 robots.txt（HTTP 404），扫描继续"
+        if ctx.status == 403:
+            return robots_url, None, "站点拒绝访问 robots.txt（HTTP 403），扫描继续"
+        return robots_url, None, (
+            "未获取到 robots.txt（"
+            f"{page_failure_reason(ctx.status, ctx.error)}），扫描继续")
 
     # ---------- 单页抓取 + 提取 ----------
     def _extract_page(self, url: str, page_seq: int) -> tuple:
@@ -175,7 +207,7 @@ class ComplianceScanThread(QThread):
         ctx = fetcher.fetch(url)
         page = LegalPage(url=url, final_url=ctx.final_url, status=ctx.status)
         if ctx.error or not ctx.html:
-            page.error = ctx.error or "无内容"
+            page.error = page_failure_reason(ctx.status, ctx.error or "无内容")
             return page, [], ""
         title, text, clauses = extract.prepare_page(
             ctx.html, page_index=page_seq, page_url=url)
@@ -287,8 +319,9 @@ class ComplianceScanThread(QThread):
             page.matched_by = seed.source
             pages.append(page)
             if page.error:
-                self._log(f"　✗ {page.error}")
-                self.signal_page.emit(seed.url, f"失败：{page.error[:80]}")
+                # 单页失败不中断扫描：该页不纳入筛查，已获得的本地结果照常保留
+                self._log(f"　✗ {page.error}（该页未纳入筛查，已获得的结果保留）")
+                self.signal_page.emit(seed.url, f"已跳过：{page.error[:80]}")
             else:
                 clauses.extend(page_clauses)
                 titles[seed.url] = page.title
@@ -376,5 +409,6 @@ def report_base_name(report) -> str:
 
 __all__ = [
     "ComplianceScanThread", "RENDER_FALLBACK_MIN_CHARS",
-    "RENDER_FALLBACK_MAX_PAGES", "default_report_file", "report_base_name",
+    "RENDER_FALLBACK_MAX_PAGES", "page_failure_reason",
+    "default_report_file", "report_base_name",
 ]
