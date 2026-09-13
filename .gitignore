@@ -19,3 +19,5 @@ chrome-win64.zip
 chrome-win32.zip
 #一个图标
 craweler.ico
+#CodeBuddy的本地记忆
+.codebuddy/
