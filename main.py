@@ -72,6 +72,29 @@ def run_selftest() -> int:
     except Exception as exc:
         print(f"[FAIL] 提取器/规则加载异常：{exc}")
 
+    # 浏览器登录态复用模块（core/browser_session）：只做只读检查，不启动浏览器
+    try:
+        from core.browser_session import detect_installed_browsers, registered_modules
+
+        modules = registered_modules()
+        detected = detect_installed_browsers()
+        detail = "、".join(f"{kind}" for kind in detected) or "未探测到"
+        print(f"[{'OK' if modules else 'FAIL'}]   登录态模块：注册 {modules or '（未注册）'}"
+              f" | 本机浏览器：{detail}")
+        if detected:
+            for kind, path in detected.items():
+                print(f"        {kind} User Data：{path}")
+    except Exception as exc:
+        print(f"[FAIL] 登录态模块加载异常：{exc}")
+
+    try:
+        from core.browser_session.cookie_store import crypto_available
+
+        print(f"[{'OK' if crypto_available() else 'WARN'}]   Cookie 加密："
+              + ("可用" if crypto_available() else "不可用（pip install cryptography，缺失时明文存储）"))
+    except Exception as exc:
+        print(f"[FAIL] Cookie 加密能力检测异常：{exc}")
+
     try:
         from core.media.merger import find_ffmpeg
 

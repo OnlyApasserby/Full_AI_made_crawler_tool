@@ -1,0 +1,88 @@
+# 浏览器登录态复用模块（core/browser_session）配置示例 —— YAML 版
+#
+# 用法（无需新增依赖，解析后交给 SessionConfig.resolve 即可）：
+#
+#     import yaml                      # pip install pyyaml（纯解析用，非运行时依赖）
+#     from core.browser_session import load_browser_session
+#
+#     with open("resources/sessions/config.example.yaml", encoding="utf-8") as f:
+#         data = yaml.safe_load(f)["browser_session"]
+#     handle = load_browser_session(data)
+#
+# 优先级（从低到高）：本文件默认值 → 环境变量 CRAWLER_SESSION_* → 代码里显式传参
+# 所有键名与 SessionConfig 字段一致；下划线开头的键不会被读取（可作注释用）。
+
+browser_session:
+  # ------------------------- 浏览器与 Profile -------------------------
+  browser: edge                 # chrome / edge / chromium
+  # 留空 = 自动探测系统默认 User Data 目录（Windows/macOS/Linux 均已覆盖）
+  user_data_dir: ""             # 例：C:\Users\me\AppData\Local\Microsoft\Edge\User Data
+  profile: Default              # Default / "Profile 1" / "Profile 2" ...
+  launcher: playwright          # playwright（默认，无需额外驱动）/ selenium
+  executable_path: ""           # 留空 = 复用 CRAWLER_CHROME_PATH 与 resources/browsers
+
+  # ------------------------------ 目标站点 ------------------------------
+  domain: example.com           # 必填：Cookie 分组与登录态探测都依赖它
+
+  # ------------------------------ 持久化 --------------------------------
+  cookie_store_path: ""         # 留空 = resources/sessions/<domain>.json
+  cookie_encrypt: true          # Cookie 等同账号凭据，默认加密落盘
+  # 加密口令请用环境变量提供，不要写进本文件：
+  #   Windows:      set CRAWLER_SESSION_KEY=你的口令
+  #   Linux/macOS:  export CRAWLER_SESSION_KEY=你的口令
+  cookie_accept: all            # all（全部）/ same-site（只保留目标域名族，更克制）
+
+  # ------------------------------- 网络 ---------------------------------
+  proxy:
+    server: ""                  # 例：http://user:pass@residential-proxy:8080
+    # username: ""              # 也可分开写用户名/密码
+    # password: ""
+  timeout: 30.0                 # 页面加载超时（秒）
+
+  # -------------------------- 窗口与指纹一致性 ---------------------------
+  headless: false               # 复用 User Data 时**必须** false（登录态与无头冲突）
+  impersonate: true             # 使用本地 Profile 的真实指纹
+  user_agent: ""                # 留空 = 用浏览器真实 UA（推荐，保持指纹一致）
+  locale: zh-CN
+  viewport: "1440x900"
+  timezone: ""                  # 必须与代理 IP 的地理位置一致，例：America/New_York
+  # geolocation: [40.71, -74.01]   # [纬度, 经度]，同样要与代理 IP 匹配
+
+  # ---------------------------- 登录态检查 ------------------------------
+  check_login: true             # 启动后是否立刻校验登录态
+  login_url: ""                 # 留空 = https://<domain>/
+  # 判定规则（按优先级）：登出关键字 → 登录关键字 → 状态码 → 兜底推断
+  logout_markers:               # 命中即判为**未登录**（最可靠的负信号）
+    - 请先登录
+    - 登录已过期
+    - 请登录后查看
+  login_markers:                # 命中即判为已登录
+    - 退出登录
+    - 个人中心
+  login_status: [200]           # 期望状态码列表（跳登录页通常是 302/401）
+  logout_selector: ""           # 未登录时存在的元素，例：.login-form
+  login_selector: ""            # 已登录时存在的元素，例：.user-avatar
+  check_timeout: 10.0
+  cookie_assume_valid: true     # 没有任何规则时的兜底结论（有 Cookie 即视为已登录）
+
+  # ---------------------- 反检测与行为拟人化（可选） ----------------------
+  # 只做"指纹一致性 + 行为拟人化"，用于降低被误判为机器人的概率，
+  # **不承诺绕过任何风控审核**，也不实现验证码绕过。
+  anti_detect: true
+  delay_mean: 0.6               # 每次操作的平均停顿（秒），0 = 关闭
+  delay_jitter: 0.5             # 停顿抖动幅度（秒）
+  action_interval: 0.3          # 同类操作最小间隔（秒）
+  rate_limit: 30                # 每分钟请求上限，0 = 不限
+  mouse_steps: 24               # 鼠标轨迹插值点数
+
+# ------------------------- 环境变量等价写法 -------------------------
+# 不想改文件时，可用环境变量覆盖任意字段（CI / 多账号切换更方便）：
+#   CRAWLER_SESSION_BROWSER=edge
+#   CRAWLER_SESSION_PROFILE=Profile 2
+#   CRAWLER_SESSION_DOMAIN=example.com
+#   CRAWLER_SESSION_USER_DATA_DIR=D:\edge-userdata
+#   CRAWLER_SESSION_COOKIE_STORE=D:\cookies\example.json
+#   CRAWLER_SESSION_HEADLESS=0
+#   CRAWLER_SESSION_LOGIN_MARKERS=退出登录,个人中心
+#   CRAWLER_SESSION_KEY=你的加密口令          （也支持 CRAWLER_SESSION_COOKIE_KEY）
+#   CRAWLER_CHROME_PATH=D:\chrome-win64\chrome.exe

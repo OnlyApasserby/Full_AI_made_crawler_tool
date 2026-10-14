@@ -14,8 +14,12 @@
 - 📦 **多内容类型**：文字 / 图片 / 视频 / 音频 / 文档一站式抓取下载
 - 🔄 **断点续爬**：进度实时入库，重启后自动续传，不重复劳动
 - 🛡️ **反爬策略**：UA 池轮换、代理支持、请求延迟抖动，浏览器渲染可携带真实 Cookie/Referer 过防盗链
+- 🔑 **登录态复用**（`core/browser_session`）：直接复用本地 Chrome / Edge 已登录的 User Data 或导出 Cookie，
+  启动即带登录态跳过登录流程；同一份登录态可同时喂给 Selenium / Playwright / requests，
+  并提供统一登录态检查与失效重登入口（含真实指纹补全、行为拟人化、住宅代理接入）
 - 🧩 **多任务并发**：多目标站点并行爬取，每个任务可选「递归爬取」或「媒体抓取」，任务级数据库 / 目录 / 日志隔离，失败自动重试，队列持久化
 - 📊 **多格式导出**：CSV / JSON / Markdown，支持爬取结果与**媒体清单**（含分辨率/合集/来源页）
+- ⚖️ **合规辅助筛查**（robots.txt 校验的扩展）：扫描目标站点公开的法律/政策页面，自动筛出与**爬虫、自动化访问、数据采集、请求频率、API 使用、绕过限制**相关的条款，连同原文片段与来源位置输出结构化报告（JSON / Markdown / HTML）。**仅作合规线索筛查，不构成法律意见、不代替律师，也不判断能否抓取**
 - 🎮 **直观 GUI**：PyQt6 界面，快捷键控制（Ctrl+P / Ctrl+R 暂停·恢复）
 
 ## 快速开始
@@ -37,6 +41,17 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### 运行测试（可选）
+
+```bash
+pip install pytest          # 也可以用标准库 unittest 运行
+python -m pytest tests/ -q                                # 单元测试：不需要浏览器、不访问网络
+python -m pytest tests/ -m "not integration" -q           # 显式排除集成测试
+python -m pytest tests/test_browser_session_integration.py -v   # 集成测试（条件不足自动 skip）
+```
+
+集成测试默认只做**只读探测**；需要真正启动浏览器时设置 `CS_INTEGRATION_LAUNCH=1`。
+
 ## 环境要求
 
 - Python 3.10+
@@ -45,6 +60,7 @@ python main.py
 - 可选：pycryptodome 或 cryptography（HLS 加密流解密，缺失时加密流会给出明确提示）
 - 可选：beautifulsoup4 + lxml（站点规则提取器的完整 CSS 选择器；缺失时退回内置简化选择器）
 - 可选：ffmpeg（外部程序，加入 PATH 即可；用于流媒体转封装 MP4 与音视频合流，缺失时保留原始容器）
+- 可选：chatanywhere API Key（合规辅助筛查的 LLM 辅助标注，未配置时自动降级为纯本地关键词检测；不引入新依赖，复用 `requests`）
 
 ## 打包为单个 exe
 
@@ -127,6 +143,51 @@ downloads\                      # 下载内容
 **多任务**：展开「爬取配置」页底部的「多任务队列」→ 点「添加任务」，可一次添加多个起始 URL，
 任务类型可选「媒体抓取（图像/视频）」；任务参数默认沿用上述三个页面的设置，也可在对话框内改为独立配置。
 
+### 合规辅助筛查（robots.txt 校验的扩展）
+
+在「爬取配置」页填好起始网址后点「合规辅助筛查…」。程序会扫描目标站点的公开法律/政策页面
+（页脚条款入口、sitemap、常见路径），自动筛出与**爬虫、自动化访问、数据采集、请求频率、
+API 使用、绕过限制**相关的条款，连同**原文片段、来源页面、位置与置信度**整理成结构化报告，
+可导出 JSON / Markdown / HTML 留档。
+
+> ⚠ **本功能只做合规信息的辅助筛查**：不构成法律意见、不能替代律师，也**不会**判断
+> 「可以抓取」或「不可以抓取」。报告中所有条目均标记为「需人工确认」，请由法务或律师
+> 复核后决定后续动作。该报告**不参与**任何自动放行/阻断决策——robots.txt 仍是唯一的硬性闸门。
+
+**扫描约束**（默认值见 `config.py` 的 `COMPLIANCE_*`）：仅同站点公开页面、扫描自身遵守 robots.txt、
+最多 12 页、页间约 1 秒礼貌间隔；不登录、不绕付费墙、不规避任何访问限制。
+报告会列出"已扫描 / 被跳过"的页面及原因，含 robots.txt 参考信息（仅客观记录，不作结论）。
+
+单个页面返回 **403 / 404** 时只跳过该页并在报告"已扫描页面"中写明原因
+（403＝站点拒绝访问、404＝入口可能已迁移），**不影响其他页面与已获得的条款线索**；
+报告附注会说明未读取页面的影响范围。robots.txt 缺失或被拒（403/404）同样不中断扫描。
+
+**LLM 辅助标注（可选）**：配置 API Key 后可让大模型对候选条款补充分类标签与核对提示。
+
+```bash
+# 推荐：环境变量提供（优先级最高）
+set CHATANYWHERE_API_KEY=sk-xxxx        # Windows
+export CHATANYWHERE_API_KEY=sk-xxxx     # Linux / macOS
+```
+
+- 也可在对话框内临时输入：**仅存于内存**，不落盘、不入库、不写入报告
+- 接口地址与模型在 `config.py` 的 `LLM_*` 中配置（默认 `https://api.chatanywhere.tech/v1`）
+- 只发送**候选条款文本片段**（默认置信度最高的 30 条、每条截断到 600 字符），不发送整页 HTML
+- 模型只提供标签与说明；**报告中的引文一律取自本地抓取的条款文本**，模型返回的引文
+  必须能在源文本中逐字匹配才会被采纳，否则丢弃并计入报告的「丢弃无法回溯的引文」
+- 未配置 Key 或调用失败时自动降级为纯本地关键词检测，功能不受影响
+- 接口返回 **403 / 404** 等**确定性失败**时立即停止重试并给出可读原因（403 指向
+  权限/来源/额度，404 指向 `LLM_BASE_URL` 配置），**本地关键词结果原样保留**；
+  只有 429 限流与 5xx 服务端错误才退避重试。分片请求中某一批失败时，
+  已成功批次得到的标注同样保留，报告里会写明降级原因
+
+**红线机制**：除提示词约束外，工具生成的所有说明文字都会再过一遍结论式表述拦截
+（命中即替换为「需人工确认」），报告附录会给出「已拦截结论式表述 N 处」，
+可在导出文件与界面中核对。
+
+**报告留档**：每次扫描的 JSON 报告保存为 `resources/compliance/<站点>_<时间戳>.json`，
+同时在数据库 `compliance_reports` 表中登记，便于对同一站点做历史对比。
+
 ### 浏览器内核配置
 
 动态渲染（`core/fetcher/playwright_fetcher.py`）需要 Chromium 内核，按以下优先级查找：
@@ -137,6 +198,57 @@ downloads\                      # 下载内容
 4. 系统已安装的 Chrome / Edge / Chromium
 5. PATH 中的 `chrome` / `chromium`
 6. 以上都没有时，自动解压项目根目录的 `chrome-win64.zip`
+
+### 浏览器登录态复用（跳过登录、降低风控误判）
+
+模块：`core/browser_session`（详见 [`core/browser_session/README.md`](core/browser_session/README.md)）。
+用途是复用**使用者本人**已登录的会话，供合法授权的自动化场景使用：
+
+**前置条件（最高频的坑）**：复用 User Data 时 Chromium 会对该目录**独占**，
+所以必须**先完全退出目标浏览器**（含任务栏后台驻留进程）。不满足时报错是
+明确且可操作的，不会静默失败；实在不能关浏览器就改用 Cookie 导出/导入方案。
+
+```bash
+# 最小示例：启动带登录态的浏览器 → 检查登录 → 导出 Cookie → requests 复用该会话
+python examples/browser_session_minimal.py --domain example.com --browser edge \
+    --check-url https://example.com/
+
+# 纯 Cookie 方案（不启动浏览器，适合服务器 / 不想关浏览器）
+python examples/browser_session_minimal.py --domain example.com --export-only   # 先导出
+python examples/browser_session_minimal.py --domain example.com --cookie-only   # 再复用
+
+# 只读自检：探测本机浏览器 / User Data / 驱动与加密依赖（不启动浏览器、不写文件）
+python -m core.browser_session
+```
+
+```python
+from core.browser_session import load_browser_session
+
+handle = load_browser_session({"browser": "edge", "domain": "example.com"})
+try:
+    driver = handle.get_driver()             # 启动即带登录态
+    if handle.check_login():                 # 统一登录态检查
+        handle.export_cookies()              # 导出（默认加密，密钥用 CRAWLER_SESSION_KEY）
+        session = handle.get_requests_session()   # requests 复用同一会话
+        print(session.get("https://example.com/me").status_code)
+finally:
+    handle.close()
+```
+
+配置示例见 `resources/sessions/config.example.yaml` 与 `config.example.json`，
+支持环境变量前缀 `CRAWLER_SESSION_*` 覆盖（`BROWSER` / `PROFILE` / `DOMAIN` /
+`USER_DATA_DIR` / `COOKIE_STORE` / `HEADLESS` / `LOGIN_MARKERS` / `KEY` 等）。
+
+> ⚠️ **合规边界**：本模块仅用于复用使用者本人已登录的会话，**不实现**绕过验证码、
+> 破解加密、伪造他人身份等功能；反检测只做指纹一致性与行为拟人化，
+> **不承诺绕过任何风控审核**，仅降低被误判为机器人的概率。
+> 目标站点若明确禁止自动化访问，请自行确认合规性。Cookie 等同账号凭据，
+> 导出文件默认加密，`resources/sessions/` 不应提交到版本库。
+
+该模块以**可插拔模块**形式接入：统一入口 `load_browser_session(config)`、
+生命周期钩子（初始化 / 健康检查 / 销毁）与模块注册见
+`core/browser_session/registry.py`；`SessionHandle.fetch()` 与框架
+`BaseFetcher.fetch()` 契约一致，可直接接入既有抓取与下载流水线。
 
 ## 项目结构
 
@@ -149,14 +261,24 @@ Full_AI_made_crawler_tool/
 │   ├── media/       #   媒体领域层：类型识别 / 数据模型 / 尺寸探测 / 流媒体（HLS·DASH·合并）
 │   ├── fetcher/     #   统一抓取层：静态 requests + 动态 playwright（含 XHR 网络监听）
 │   ├── extractor/   #   媒体提取器插件体系（规则 / 网络事件 / HTML / JSON）
+│   ├── browser_session/ # 浏览器登录态复用（可插拔模块）：
+│   │                #   config 配置与路径探测 / cookie_store 导出与加密持久化 /
+│   │                #   launcher 带 User Data 启动与占用检测 / session_bridge 桥接到
+│   │                #   Selenium·Playwright·requests / login_state 登录态检查 /
+│   │                #   anti_detect 指纹一致性 / registry 模块注册与生命周期钩子
 │   ├── paginator.py #   图集/列表翻页策略（下一页链接、数字页码、接口模板）
 │   ├── pipeline.py  #   去重与质量过滤流水线（URL 归一化、MD5、感知哈希、尺寸体积）
 │   ├── media_crawler.py # 媒体抓取编排线程
+│   ├── compliance/  #   合规辅助筛查：法律页面发现 / 正文与条款切分 / 分类打分 / LLM 标注 / 报告
 │   └── ...          #   递归爬取、下载、链接过滤、页面解析、robots、安全检测
+├── examples/        # 最小可运行示例（browser_session_minimal.py）
+├── tests/           # 单元测试 + 集成测试（pytest / unittest 均可运行）
 ├── manager/         # 任务调度：多任务队列、并发线程池、数据库管理
-├── ui/              # PyQt6 界面：主窗口（三标签页）、多任务队列面板、规则对话框、结果导出
-├── utils/           # 工具库：UA 池、URL 校验、辅助函数
+├── ui/              # PyQt6 界面：主窗口（三标签页）、多任务队列面板、规则对话框、合规筛查与结果导出
+├── utils/           # 工具库：UA 池、URL 校验、辅助函数、统一日志获取
 └── resources/       # 资源文件、默认缓存数据库、本地浏览器内核与站点规则
     ├── browsers/    #   离线浏览器内核（chrome-win64，自动解压）
+    ├── compliance/  #   合规辅助筛查报告留档（<站点>_<时间戳>.json）
+    ├── sessions/    #   登录态 Cookie 存储与配置示例（config.example.*，凭据不入库）
     └── rules/       #   站点规则 *.json（热加载，_template.json 为格式示例）
 ```

@@ -5,6 +5,7 @@
 - crawl_tasks：每次爬取任务记录（status=running 表示未完成）
 - media_downloads：媒体下载状态记录
 - media_items：媒体抓取发现的资源（含分辨率/时长/合集等元信息）
+- compliance_reports：合规辅助筛查报告（含完整报告 JSON，供历史对比）
 
 本模块只依赖标准库，供 core（爬虫/下载器）与 manager / ui 层共用，
 因此没有对上层模块的引用，不会形成循环导入。
@@ -85,6 +86,24 @@ def ensure_schema(db_path: str) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_media_items_task "
                  "ON media_items (task_id)")
+    # 合规辅助筛查报告：同一站点可保留多次扫描历史，便于对比条款变化
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS compliance_reports (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            site        TEXT NOT NULL DEFAULT '',
+            start_url   TEXT NOT NULL DEFAULT '',
+            scan_time   TEXT NOT NULL DEFAULT '',
+            engine      TEXT NOT NULL DEFAULT 'local',
+            pages       INTEGER DEFAULT 0,
+            hits        INTEGER DEFAULT 0,
+            report_path TEXT DEFAULT '',
+            report_json TEXT NOT NULL DEFAULT '{}',
+            task_id     INTEGER DEFAULT 0,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_compliance_site "
+                 "ON compliance_reports (site)")
     conn.commit()
     # 旧版本数据库没有status/file_path/task_id列时自动补列
     cols = [row[1] for row in conn.execute("PRAGMA table_info(crawled_urls)").fetchall()]
@@ -317,6 +336,112 @@ def clear_media_items(db_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 合规辅助筛查报告（compliance_reports）
+#
+# 一个站点可保留多次扫描历史，便于前后对比条款变化；
+# 列表查询只返回元信息（不含报告正文），完整报告按 id 单独读取。
+# ---------------------------------------------------------------------------
+def save_compliance_report(db_path: str, report, file_path: str = "",
+                           task_id: int = 0) -> bool:
+    """登记一份合规筛查报告（内部容错）。
+
+    :param report: :class:`core.compliance.models.ComplianceReport` 或其 ``to_dict()``
+    :param file_path: 报告留档文件路径（落盘失败时传空串）
+    :return: 是否写入成功
+    """
+    data = report if isinstance(report, dict) else getattr(report, "to_dict", None)
+    if callable(data):
+        data = data()
+    if not isinstance(data, dict):
+        return False
+    try:
+        import json as _json
+        conn = _connect(db_path)
+        conn.execute(
+            "INSERT INTO compliance_reports (site, start_url, scan_time, engine, "
+            "pages, hits, report_path, report_json, task_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(data.get("site") or ""), str(data.get("start_url") or ""),
+             str(data.get("scan_time") or ""), str(data.get("engine") or "local"),
+             len([p for p in (data.get("pages") or []) if not p.get("error")]),
+             len(data.get("findings") or []), str(file_path or ""),
+             _json.dumps(data, ensure_ascii=False), int(task_id or 0)))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def load_compliance_reports(db_path: str, site: str = "",
+                            limit: int = 20) -> list[dict]:
+    """读取合规报告列表（元信息，不含报告正文；内部容错）。"""
+    if not os.path.exists(db_path):
+        return []
+    sql = ("SELECT id, site, start_url, scan_time, engine, pages, hits, "
+           "report_path, created_at FROM compliance_reports")
+    params: list = []
+    if site:
+        sql += " WHERE site=?"
+        params.append(str(site))
+    sql += " ORDER BY id DESC"
+    if limit and limit > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    try:
+        conn = _connect(db_path)
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    keys = ("id", "site", "start_url", "scan_time", "engine", "pages", "hits",
+            "report_path", "created_at")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def load_compliance_report(db_path: str, report_id) -> dict | None:
+    """按 id 读取单份完整报告（含报告正文；内部容错）。"""
+    if not os.path.exists(db_path):
+        return None
+    try:
+        import json as _json
+        conn = _connect(db_path)
+        row = conn.execute(
+            "SELECT report_json FROM compliance_reports WHERE id=?",
+            (int(report_id),)).fetchone()
+        conn.close()
+        if not row or not row[0]:
+            return None
+        return _json.loads(row[0])
+    except Exception:
+        return None
+
+
+def count_compliance_reports(db_path: str) -> int:
+    """统计已登记的合规报告数量（内部容错）。"""
+    try:
+        conn = _connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM compliance_reports").fetchone()[0]
+        conn.close()
+        return int(count or 0)
+    except Exception:
+        return 0
+
+
+def clear_compliance_reports(db_path: str) -> int:
+    """清空合规报告表，返回删除条数（内部容错）。"""
+    try:
+        conn = _connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM compliance_reports").fetchone()[0]
+        conn.execute("DELETE FROM compliance_reports")
+        conn.commit()
+        conn.close()
+        return int(count or 0)
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # 未完成任务查询（启动续爬检测，供主窗口使用）
 # ---------------------------------------------------------------------------
 def get_unfinished_tasks(db_path: str) -> list[dict]:
@@ -379,6 +504,8 @@ __all__ = [
     "ensure_schema", "url_fingerprint", "load_visited_hashes", "create_crawl_task",
     "finish_crawl_task", "save_crawled_url", "save_media_state",
     "save_media_items", "load_media_items", "count_media_items", "clear_media_items",
+    "save_compliance_report", "load_compliance_reports", "load_compliance_report",
+    "count_compliance_reports", "clear_compliance_reports",
     "get_unfinished_tasks", "abandon_unfinished_tasks", "clear_crawled_records",
     "configure_wal",
 ]
