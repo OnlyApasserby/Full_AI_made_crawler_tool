@@ -1,0 +1,77 @@
+{
+  "_comment": "浏览器登录态复用模块（core/browser_session）配置示例 —— JSON 版；零依赖，json.load 后交给 load_browser_session(data) 即可。键名与 SessionConfig 字段一致。",
+  "_usage": "from core.browser_session import load_browser_session; import json; cfg = json.load(open('resources/sessions/config.example.json', encoding='utf-8'))['browser_session']; handle = load_browser_session(cfg)",
+  "_priority": "默认值 < 环境变量 CRAWLER_SESSION_* < 代码显式传参",
+
+  "browser_session": {
+    "browser": "edge",
+    "user_data_dir": "",
+    "profile": "Default",
+    "launcher": "playwright",
+    "executable_path": "",
+
+    "domain": "example.com",
+
+    "cookie_store_path": "",
+    "cookie_encrypt": true,
+    "cookie_accept": "all",
+
+    "proxy": {
+      "server": ""
+    },
+    "timeout": 30.0,
+
+    "headless": false,
+    "impersonate": true,
+    "user_agent": "",
+    "locale": "zh-CN",
+    "viewport": "1440x900",
+    "timezone": "",
+    "geolocation": null,
+
+    "check_login": true,
+    "login_url": "",
+    "logout_markers": ["请先登录", "登录已过期", "请登录后查看"],
+    "login_markers": ["退出登录", "个人中心"],
+    "login_status": [200],
+    "logout_selector": "",
+    "login_selector": "",
+    "check_timeout": 10.0,
+    "cookie_assume_valid": true,
+
+    "anti_detect": true,
+    "delay_mean": 0.6,
+    "delay_jitter": 0.5,
+    "action_interval": 0.3,
+    "rate_limit": 30,
+    "mouse_steps": 24
+  },
+
+  "_cookie_file_format": {
+    "_comment": "Cookie 存储文件的格式（明文时；加密时为 '#!{...头}' + 密文，自动识别）。normalize 阶段会容忍缺失字段与各种过期时间写法。",
+    "version": 1,
+    "domain": "example.com",
+    "browser": "edge",
+    "profile": "Default",
+    "exported_at": "2026-01-01 12:00:00",
+    "encrypted": false,
+    "fingerprint": "3f2a9c1d5e7b8064",
+    "cookie_count": 1,
+    "domain_counts": {
+      ".example.com": 1
+    },
+    "notes": [],
+    "cookies": [
+      {
+        "name": "sessionid",
+        "value": "请填入真实值（示例里用占位）",
+        "domain": ".example.com",
+        "path": "/",
+        "secure": true,
+        "httpOnly": true,
+        "expiry": 1893456000,
+        "sameSite": "Lax"
+      }
+    ]
+  }
+}

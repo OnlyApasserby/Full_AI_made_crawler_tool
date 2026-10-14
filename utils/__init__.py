@@ -4,4 +4,5 @@
 - helpers：时间 / 名称 / 大小等通用格式化与解析
 - validators：URL 等输入验证
 - user_agents：常用 UA 池与线程安全随机 UA 提供者
+- logging_setup：统一的 logger 获取（未配置 logging 时自动兜底控制台输出）
 """

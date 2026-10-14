@@ -15,6 +15,10 @@ dist/
 resources/browsers/
 # 合规辅助筛查报告留档（运行期生成，按站点与时间戳命名）
 resources/compliance/
+# 浏览器登录态（Cookie 等同账号凭据，绝不入库；保留示例配置）
+resources/sessions/*
+!resources/sessions/config.example.yaml
+!resources/sessions/config.example.json
 chrome-win64.zip
 chrome-win32.zip
 #一个图标
