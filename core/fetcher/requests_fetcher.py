@@ -91,6 +91,29 @@ class RequestsFetcher(BaseFetcher):
             finally:
                 self._local.session = None
 
+    # ---------- 登录态复用（core/browser_session 接入点） ----------
+    def set_cookie_jar(self, jar) -> None:
+        """把外部 cookie jar 挂到当前线程的 Session 上（复用浏览器登录态）。
+
+        :param jar: :class:`requests.cookies.RequestsCookieJar`；传 None 表示清空
+        """
+        session = self._session()
+        if jar is None:
+            session.cookies.clear()
+        else:
+            session.cookies = jar
+
+    def set_proxy(self, proxy: dict | None) -> None:
+        """覆盖代理配置（``{"http": ..., "https": ...}``）。
+
+        与请求参数里的 ``proxies=`` 是"或"的关系：显式传入的优先，
+        因此这里挂到 Session 上可以让"只在会话级配置一次"生效。
+        """
+        self.proxy = dict(proxy or {})
+        session = getattr(self._local, "session", None)
+        if session is not None:
+            session.proxies.update(self.proxy)
+
     # ---------- 抓取主流程 ----------
     def fetch(self, url: str, *, wait_selector: str = "", scroll: bool = False,
               max_scroll: int = 8, timeout: float | None = None,
